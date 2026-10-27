@@ -1,5 +1,7 @@
 # pcbstitch
 
+**New here? Start with the [Quick start](QUICKSTART.md) · [クイックスタート(日本語)](QUICKSTART.ja.md)**
+
 Stitch overlapping close-up photos of a flat object, mainly PCB teardown photography, into
 one high-resolution image. Hugin does the work; `pcbstitch` wraps it in a recipe that was
 tuned and checked against hand-made Hugin stitches of real boards.
