@@ -60,6 +60,8 @@ To remove: `./install.sh --uninstall`.
   tape them down.
 - **Name the files in order** (for example `front1`, `front2`, `front3`) and keep only one
   good photo of each position.
+- **Shoot one side in one session.** If loose parts are moved between photos (for example,
+  photos taken on different days), parts of them can show up twice or cut off.
 
 ## 3. Stitch
 
@@ -71,6 +73,11 @@ pcbstitch back1.ARW back2.ARW back3.ARW
 ```
 Sony `.ARW` and other raw files are converted to PNG automatically, into a `png/` folder.
 You can also pass PNG, TIFF or JPEG files directly.
+
+**Pass only the photos of that strip.** Avoid `pcbstitch *.ARW` if the folder also holds other
+shots, such as a close-up of a chip. If you do pass an extra photo that adds nothing new, the
+tool skips it and says so (`skipping …`). If the photos were taken at different times, it shows
+a warning.
 
 The result goes into a `stitched/` folder:
 ```
@@ -118,6 +125,8 @@ Always look at the image yourself too, especially where the photos overlap.
 | `missing tools: …` | install the tools from step 1 |
 | `need at least two images` | give it two or more photos |
 | `images could not all be connected` | the photos don't overlap enough, or they are from different sides. Check the order and the overlap |
+| `photos were taken at different times` | some photos are from another session. If the result looks wrong, use only photos from one session |
+| `skipping X: its whole area is covered` | normal: X added nothing new, so it was left out. Check that you passed the right photos |
 | `has no focal length in EXIF` | the photos have no camera information. Add `--focal 90` (your lens's focal length) |
 
 If you're still stuck, send the `.log` file from the `stitched/` folder to whoever maintains this tool.

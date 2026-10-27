@@ -17,11 +17,14 @@ Pipeline
   3. control points: cpfind (4x the default density), cpclean, then per image pair only points
      consistent with one planar homography are kept (removes parallax on tall parts and objects
      that moved between shots), weak redundant pairs are dropped, and after optimising, points
-     that still do not fit are pruned and the geometry re-optimised.
+     that still do not fit are pruned and the geometry re-optimised. Frames whose whole area is
+     covered by the others are skipped (--keep-redundant keeps them), and photos taken far apart
+     in time trigger a warning, since loose parts may have moved.
   4. photometric: exposure + vignetting + camera response (as Hugin's GUI does).
   5. blending: for images in a row/column, seams are routed through areas where the overlapping
-     images agree and the layers are feathered along them (avoids broken/ghosted cables and
-     parts that moved); other layouts fall back to enblend. --blend chooses explicitly.
+     images agree, every pixel is assigned to exactly one image, and the layers are feathered
+     along the seams (avoids broken/ghosted cables and parts that moved); other layouts fall back
+     to enblend. --blend chooses explicitly.
   6. output cropped to Hugin's autocrop, ICC profile + EXIF copied from the anchor image,
      and a QA line: control-point error and pixels that match none of the source images.
 
@@ -215,6 +218,73 @@ def prune(run, src, dst, log):
     return len(bad)
 
 
+# ----------------------------------------------------------------------------- redundant frames
+
+def capture_time(img):
+    """EXIF DateTimeOriginal as a datetime, or None."""
+    from datetime import datetime
+    try:
+        s = Image.open(img).getexif().get_ifd(0x8769).get(36867)
+        return datetime.strptime(s.strip(), "%Y:%m:%d %H:%M:%S") if s else None
+    except Exception:
+        return None
+
+
+def sharpness(img):
+    g = cv2.imread(str(img), cv2.IMREAD_GRAYSCALE)
+    g = cv2.resize(g, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+
+def footprints(run, pto):
+    """Each image's outline on a common panorama canvas, rasterised at about 1000 px."""
+    run("pano_modify", "--projection=0", "--fov=AUTO", "--canvas=AUTO", "-o", "probe.pto", pto)
+    lines = read_pto(Path(run.workdir) / "probe.pto")
+    p = next(l for l in lines if l.startswith("p "))
+    W, H = (int(re.search(rf" {k}(\d+)", p).group(1)) for k in "wh")
+    s = 1000 / max(W, H)
+    masks = []
+    for idx, l in enumerate(x for x in lines if x.startswith("i ")):
+        w, h = (int(re.search(rf" {k}(\d+)", l).group(1)) for k in "wh")
+        t = np.linspace(0, 1, 40)
+        border = np.r_[np.c_[t * w, 0 * t], np.c_[w + 0 * t, t * h], np.c_[w - t * w, h + 0 * t], np.c_[0 * t, h - t * h]]
+        poly = trafo(run, "probe.pto", idx, border) * s
+        m = np.zeros((int(H * s) + 1, int(W * s) + 1), np.uint8)
+        cv2.fillPoly(m, [np.round(poly).astype(np.int32)], 1)
+        masks.append(m > 0)
+    return masks
+
+
+def find_redundant(masks, images, times, log, threshold=0.97):
+    """Frames whose whole area is covered by the other frames add nothing but extra seams (and,
+    if shot at another time, things that moved). Greedily drop them, never the anchor (index 0):
+    prefer the frame shot furthest from the others, then the least sharp."""
+    known = [t for t in times if t]
+    median = sorted(known)[len(known) // 2] if known else None
+    gap = [abs((t - median).total_seconds()) if t and median else 0 for t in times]
+    sharp = {}
+    alive, dropped = list(range(len(images))), []
+    while len(alive) > 2:
+        cands = []
+        for i in alive:
+            if i == 0:
+                continue
+            others = np.any([masks[j] for j in alive if j != i], axis=0)
+            frac = (masks[i] & others).sum() / max(int(masks[i].sum()), 1)
+            log.write(f"redundancy: {images[i].name} {frac:.1%} covered by the others\n")
+            if frac >= threshold:
+                cands.append(i)
+        if not cands:
+            break
+        for i in cands:
+            if i not in sharp:
+                sharp[i] = sharpness(images[i])
+        pick = max(cands, key=lambda i: (gap[i], -sharp[i]))
+        alive.remove(pick)
+        dropped.append(pick)
+    return dropped, gap
+
+
 # ----------------------------------------------------------------------------- blending
 
 def load_layers(files):
@@ -240,7 +310,9 @@ def strip_axis(alphas):
 
 def seam_blend(layers, band, log):
     """Seams between consecutive layers (top to bottom) routed through the cheapest path where the
-    layers agree, then a feathered composite. Works on vertical stacks; callers transpose for rows."""
+    layers agree, then a feathered composite. Works on vertical stacks; callers transpose for rows.
+    Every pixel is assigned to exactly one layer: the one whose band between seams contains it, or
+    else the nearest layer in the stack that covers it, so non-adjacent layers are never averaged."""
     maxv = 65535 if layers[0].dtype == np.uint16 else 255
     # full-coverage pixels only, minus the resampled boundary
     A = [cv2.erode((l[:, :, 3] == maxv).astype(np.uint8), np.ones((5, 5))) > 0 for l in layers]
@@ -250,12 +322,14 @@ def seam_blend(layers, band, log):
     small = [cv2.resize(l[:, :, :3], (W // s, H // s), interpolation=cv2.INTER_AREA).astype(np.float32)
              * (255.0 / maxv) for l in layers]
     smallA = [cv2.resize(a.astype(np.uint8), (W // s, H // s), interpolation=cv2.INTER_NEAREST) > 0 for a in A]
-    keep = [a.copy() for a in A]
     yy = np.arange(H)[:, None]
+    seams = []
     for u, d in zip(order, order[1:]):
         ov = cv2.erode((smallA[u] & smallA[d]).astype(np.uint8), np.ones((5, 5))) > 0
         if not ov.any():
             log.write(f"seam: layers {u} and {d} do not overlap\n")
+            mid = (np.nonzero(A[u])[0].max() + np.nonzero(A[d])[0].min()) / 2
+            seams.append(np.full((1, W), mid))
             continue
         diff = cv2.GaussianBlur(np.abs(small[u] - small[d]).max(2), (0, 0), 2)
         cost = np.where(ov, diff + 1.0, 1e6)
@@ -279,13 +353,23 @@ def seam_blend(layers, band, log):
         seam = np.interp(np.arange(W), np.arange(W // s) * s + s / 2, path * s + s / 2)[None, :]
         on = float(np.mean(diff[path[cols], cols]))
         log.write(f"seam layers {u}/{d}: mean |diff| on seam {on:.1f}, overlap mean {diff[ov].mean():.1f}\n")
-        keep[u] &= (yy < seam + band) | ~A[d]      # trim only where the other layer covers
-        keep[d] &= (yy > seam - band) | ~A[u]
+        seams.append(seam)
+    # preferred rank = number of seams above the pixel; fall back to the nearest covering rank
+    n = len(order)
+    pref = np.zeros((H, W), np.int8)
+    for sm in seams:
+        pref += (yy >= sm)
+    label = np.full((H, W), -1, np.int8)
+    for dist in range(n):
+        for r in range(n):          # ascending: the upper layer wins ties
+            hit = (label < 0) & A[order[r]] & (np.abs(pref - r) == dist)
+            label[hit] = r
     num = np.zeros((H, W, 3), np.float32)
     den = np.zeros((H, W), np.float32)
-    for l, k, a in zip(layers, keep, A):
-        w = cv2.GaussianBlur(k.astype(np.float32), (0, 0), band / 2) * a
-        num += l[:, :, :3].astype(np.float32) * w[:, :, None]
+    for r, i in enumerate(order):
+        # small floor keeps every covered pixel filled where a feather fades to zero
+        w = (cv2.GaussianBlur((label == r).astype(np.float32), (0, 0), band / 2) + 1e-4) * A[i]
+        num += layers[i][:, :, :3].astype(np.float32) * w[:, :, None]
         den += w
     rgb = np.clip(num / np.maximum(den, 1e-6)[:, :, None] + 0.5, 0, maxv).astype(layers[0].dtype)
     alpha = np.where(den > 1e-3, maxv, 0).astype(layers[0].dtype)
@@ -373,6 +457,8 @@ def main():
     ap.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
                     help="coarse rotation when developing raws")
     ap.add_argument("--redevelop", action="store_true", help="re-develop raws even if PNGs exist")
+    ap.add_argument("--keep-redundant", action="store_true",
+                    help="use every image, even ones fully covered by the others (default: skip them)")
     ap.add_argument("--qa-image", action="store_true", help="also write <name>_qa.jpg marking ghost pixels")
     ap.add_argument("--keep-temp", action="store_true", help="keep the work directory")
     a = ap.parse_args()
@@ -412,24 +498,43 @@ def main():
     print(f"{base}: {n} images, anchor {ordered[0].name} -> {out_png}")
     try:
         fov = a.fov or hfov_from_exif(ordered[0], a.crop_factor, a.focal)
-        step(f"project (HFOV {fov:.2f}°)")
-        run("pto_gen", "-f", f"{fov:.6f}", "-o", "a.pto", *ordered)
+        times = [capture_time(p) for p in ordered]
+        known = [t for t in times if t]
+        if known and (max(known) - min(known)).total_seconds() > 3600:
+            print("  warning: these photos were taken at different times; loose parts may have moved:")
+            for p, t in zip(ordered, times):
+                print(f"    {p.name}: {t or 'unknown'}")
 
-        step("control points")
-        run("cpfind", "--multirow", "--sieve2size", a.points, "-o", "b.pto", "a.pto")
-        run("cpclean", "-o", "c.pto", "b.pto")
-        kept, ok = ransac_filter(work / "c.pto", work / "d.pto", a.ransac_px, log)
-        if not ok or kept == 0:
-            die("images could not all be connected by control points; check overlap/order")
+        def align(images):
+            n = len(images)
+            step(f"project ({n} images, HFOV {fov:.2f}°)")
+            run("pto_gen", "-f", f"{fov:.6f}", "-o", "a.pto", *images)
+            step("control points")
+            run("cpfind", "--multirow", "--sieve2size", a.points, "-o", "b.pto", "a.pto")
+            run("cpclean", "-o", "c.pto", "b.pto")
+            kept, ok = ransac_filter(work / "c.pto", work / "d.pto", a.ransac_px, log)
+            if not ok or kept == 0:
+                die("images could not all be connected by control points; check overlap/order")
+            step("geometric optimisation")
+            geo = ["b0"] + [f"{v}{i}" for i in range(1, n) for v in ("r", "p", "y", "TrX", "TrY", "TrZ")]
+            run("pto_var", "--opt", ",".join(geo), "-o", "e.pto", "d.pto")
+            run("autooptimiser", "-n", "-o", "f.pto", "e.pto")
+            for _ in range(3):
+                if prune(run, "f.pto", "f2.pto", log) == 0:
+                    break
+                run("autooptimiser", "-n", "-o", "f.pto", "f2.pto")
 
-        step("geometric optimisation")
-        geo = ["b0"] + [f"{v}{i}" for i in range(1, n) for v in ("r", "p", "y", "TrX", "TrY", "TrZ")]
-        run("pto_var", "--opt", ",".join(geo), "-o", "e.pto", "d.pto")
-        run("autooptimiser", "-n", "-o", "f.pto", "e.pto")
-        for _ in range(3):
-            if prune(run, "f.pto", "f2.pto", log) == 0:
-                break
-            run("autooptimiser", "-n", "-o", "f.pto", "f2.pto")
+        align(ordered)
+        if n > 2 and not a.keep_redundant:
+            dropped, gap = find_redundant(footprints(run, "f.pto"), ordered, times, log)
+            if dropped:
+                for i in dropped:
+                    why = f", taken {gap[i] / 3600:.1f} h apart from the others" if gap[i] > 3600 else ""
+                    print(f"  skipping {ordered[i].name}: its whole area is covered by the other photos{why}"
+                          " (use --keep-redundant to keep it)")
+                ordered = [p for i, p in enumerate(ordered) if i not in dropped]
+                n = len(ordered)
+                align(ordered)
 
         step("photometric optimisation")
         pho = ["Vb0", "Vc0", "Vd0", "Ra0", "Rb0", "Rc0", "Rd0", "Re0"] + [f"Eev{i}" for i in range(1, n)]

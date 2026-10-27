@@ -124,6 +124,7 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
 | `--png-dir DIR` | `<raw dir>/png` | where developed raws go |
 | `--rotate 0\|90\|180\|270` | `0` | coarse rotation applied when developing raws |
 | `--redevelop` | off | develop raws again even if PNGs exist |
+| `--keep-redundant` | off | use every image, even ones fully covered by the others |
 | `--qa-image` | off | write `<name>_qa.jpg` |
 | `--keep-temp` | off | keep the work directory (layers, intermediate `.pto` files) |
 
@@ -157,11 +158,13 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
    - Image 0 is fixed. Every other image gets roll, pitch, yaw and X/Y/Z translation; barrel distortion `b` is shared.
    - The HFOV is **not** optimised.
    - Then up to three rounds of: compute each point's residual in source-image pixels, drop points above max(3 px, 3× median), re-optimise.
+   - **Session check:** if the photos' EXIF capture times span more than an hour, it warns and lists them, because loose parts may have moved in between.
+   - **Redundant frames:** with three or more images, each image's outline is projected onto the panorama. An image whose area is at least 97% covered by the others is skipped and reported, and steps 2–4 run again without it. It never drops the anchor; it prefers to drop a frame taken furthest in time from the others, then the least sharp one. `--keep-redundant` turns this off.
 5. **Optimise photometrics** (`vig_optimize`): exposure of each non-anchor image, plus vignetting (`Vb Vc Vd`) and the camera response curve (`Ra…Re`).
 6. **Set up output** (`pano_modify`): rectilinear projection, automatic FOV and canvas, autocrop.
 7. **Render** each image as its own full-canvas layer (`nona -m TIFF_m`).
 8. **Blend**:
-   - **seams** (a single row or column): for each neighbouring pair, find the cheapest left-to-right path through the overlap, where cost is how much the two layers differ. Trim each layer to its side of the seam ± `band`, then feather-composite.
+   - **seams** (a single row or column): for each neighbouring pair, find the cheapest left-to-right path through the overlap, where cost is how much the two layers differ. Each pixel is then assigned to **exactly one** layer: the one whose band between seams contains it, or else the nearest layer in the strip that covers it. The labels are feathered (σ = `band`/2) into the composite.
    - **enblend**: plain `enblend` on the layers, as Hugin itself does.
 9. **Write output**:
    - Crop to Hugin's autocrop rectangle, shrunk by a few pixels (see below).
@@ -277,6 +280,29 @@ Two edge cases cost some time:
   at coverage boundaries. enblend's pyramid then pulls in the black outside the mask, which
   shows as a dark line a few pixels wide. Feathering avoids that.
 
+### Extra frames and one layer per pixel
+
+A real run passed four frames: a three-shot strip plus a close-up of the main IC taken
+**43 hours later** at a different shutter speed. The close-up overlapped the strip completely,
+but the antenna boards had been moved between the two sessions. Two problems followed:
+
+- **The seam rule leaked.** The original seam blender trimmed each layer only against its
+  immediate neighbour in the strip. Where the neighbour didn't cover a pixel, the layer kept it,
+  even if a third layer did. So the close-up kept pixels showing an antenna board that, in the
+  other frames, wasn't there: a green fragment at the edge of the stitch (11,185 ghost pixels in
+  2 regions).
+- **Graph cut was not the answer.** OpenCV's general graph-cut seam finder
+  (`cv2.detail_GraphCutSeamFinder`) handles every overlapping pair, but here it did worse
+  (17,083 pixels in 6 regions), cutting through antenna-board edges. It was also 2–3× slower.
+
+What fixed it:
+- **Skip frames that add no area.** Here the close-up was skipped, giving 243 scattered pixels
+  and 0 regions. The different shooting times also produce a warning.
+- **Exactly one layer per pixel.** The strip seams give each pixel a preferred layer, with a
+  fallback to the nearest layer that covers it. With `--keep-redundant`, the same four frames now
+  give 1,023 pixels in 1 region, and the shin back set (with the moved cable) went from 1,966
+  ghost pixels in 2 regions to 0.
+
 ### Edges and cropping
 
 `nona` leaves partly covered, darkened pixels along each layer's boundary:
@@ -369,9 +395,13 @@ Things that made stitching harder in practice:
 - **Expect parallax on tall parts.** Tall parts (shields, electrolytics, connectors, labels on
   blocks) will never align perfectly at macro distance. More overlap gives the seam room to go
   around them.
-- **Choose between retakes yourself.** The script doesn't pick between near-duplicate frames.
-  In one set the retake was 3–8× less sharp (variance of Laplacian) than the original. A quick
-  check:
+- **Pass only the strip's photos.** The script skips a frame that is completely covered by the
+  others, but it's better not to pass extra shots at all. Running `pcbstitch *.ARW` in a folder
+  that also holds a close-up taken another day added that close-up as a fourth frame. The antenna
+  boards had moved since, which left a fragment of one in the stitch.
+- **Retakes.** If you pass both a frame and its retake, the redundancy check drops one of them,
+  preferring the less sharp one. In one set the retake was 3–8× less sharp (variance of
+  Laplacian) than the original. To check yourself:
   ```python
   import cv2; print(cv2.Laplacian(cv2.imread("frame.png", 0), cv2.CV_64F).var())
   ```
@@ -386,6 +416,8 @@ Things that made stitching harder in practice:
 | `images could not all be connected` | too little overlap, frames in the wrong set, or a featureless area. Check the order and overlap; try `--points 6`. |
 | High mean error (> 2–3 px) | parallax or moved objects dominating. Check `<name>_stitched.log` for how many points the planar filter kept per pair. A lower `--ransac-px` is stricter. |
 | Ghost regions in the summary | use `--qa-image` to see them. Often a tall part or a moved cable inside the overlap with no clean path round it; more overlap or re-shooting helps. Try `--band 12` for a tighter seam. |
+| `photos were taken at different times` | the frames come from different sessions; anything loose may have moved. Prefer frames from one session. |
+| `skipping X: its whole area is covered` | X added no new area, so it was left out. Usually an extra shot passed by mistake. Use `--keep-redundant` to keep it. |
 | Board appears rotated | raws: `--rotate 90/180/270` (applied at development; use `--redevelop` if PNGs exist). |
 | `photometric optimisation failed` | too few points for vig_optimize; the stitch continues without exposure and vignetting correction. |
 | 2D grid of shots | `auto` falls back to enblend; check the result for ghosting. |
