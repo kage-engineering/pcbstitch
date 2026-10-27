@@ -19,17 +19,23 @@ sudo apt install git hugin-tools enblend rawtherapee
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Then download pcbstitch and make the `pcbstitch` command available:
+Then download pcbstitch and install the `pcbstitch` command:
 ```
 git clone https://github.com/kage-engineering/pcbstitch.git
-mkdir -p ~/.local/bin
-ln -s "$PWD/pcbstitch/pcbstitch" ~/.local/bin/pcbstitch
+cd pcbstitch
+./install.sh
 ```
-Open a new terminal and check that it works:
+`install.sh` makes `pcbstitch` work from **any folder**: it adds it to your PATH for bash,
+zsh and fish, and warns if any required tool is missing.
+
+**Open a new terminal** and check that it works, from any folder:
 ```
 pcbstitch --help
 ```
 The first real run takes a little longer, because it downloads a few Python packages.
+
+To update later: `cd pcbstitch && git pull` (no need to reinstall).
+To remove: `./install.sh --uninstall`.
 
 ## 2. Take the photos
 
@@ -94,6 +100,7 @@ Always look at the image yourself too, especially where the photos overlap.
 
 | Message | What to do |
 |---|---|
+| `pcbstitch: command not found` | open a new terminal after `./install.sh`. If it still fails, run `./install.sh` again from the `pcbstitch` folder |
 | `missing tools: …` | install the tools from step 1 |
 | `need at least two images` | give it two or more photos |
 | `images could not all be connected` | the photos don't overlap enough, or they are from different sides. Check the order and the overlap |

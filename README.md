@@ -49,9 +49,17 @@ You need these on your `PATH`:
 On Arch / CachyOS: `pacman -S hugin enblend-enfuse rawtherapee uv`.
 
 ```
-git clone git@github.com:kage-engineering/pcbstitch.git
-ln -s "$PWD/pcbstitch/pcbstitch" ~/.local/bin/pcbstitch
+git clone https://github.com/kage-engineering/pcbstitch.git
+cd pcbstitch && ./install.sh
 ```
+
+`install.sh` links the script into uv's bin directory (usually `~/.local/bin`). If that
+directory isn't on your PATH, it adds a guarded, marked line to `~/.bashrc`, the bash login
+file (`~/.bash_profile`, `~/.bash_login` or `~/.profile`, whichever exists first) and
+`~/.zshrc`, plus `~/.config/fish/conf.d/pcbstitch.fish`. Then it checks the dependencies.
+Open a new terminal afterwards.
+- **Updating:** the link points at the checkout, so `git pull` updates the command.
+- **Removing:** `./install.sh --uninstall` removes the link and every line it added.
 
 The script is one file with [inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/),
 and its shebang is `uv run --script`, so you don't need a virtualenv.

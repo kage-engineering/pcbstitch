@@ -19,17 +19,22 @@ sudo apt install git hugin-tools enblend rawtherapee
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-次に pcbstitch をダウンロードし、`pcbstitch` コマンドを使えるようにします。
+次に pcbstitch をダウンロードし、`pcbstitch` コマンドをインストールします。
 ```
 git clone https://github.com/kage-engineering/pcbstitch.git
-mkdir -p ~/.local/bin
-ln -s "$PWD/pcbstitch/pcbstitch" ~/.local/bin/pcbstitch
+cd pcbstitch
+./install.sh
 ```
-新しいターミナルを開いて、動くか確認します。
+`install.sh` は `pcbstitch` を **どのフォルダからでも** 実行できるようにします(bash・zsh・fish の PATH に追加します)。必要なツールが足りない場合は警告を表示します。
+
+**新しいターミナルを開いて**、どのフォルダからでも動くか確認します。
 ```
 pcbstitch --help
 ```
 初回の実行時は Python パッケージをダウンロードするため、少し時間がかかります。
+
+更新するとき: `cd pcbstitch && git pull`(再インストールは不要です)。
+削除するとき: `./install.sh --uninstall`。
 
 ## 2. 写真を撮る
 
@@ -88,6 +93,7 @@ done: front_stitched.png 5942x8406
 
 | メッセージ | 対処 |
 |---|---|
+| `pcbstitch: command not found` | `./install.sh` の後に新しいターミナルを開いてください。それでも動かない場合は、`pcbstitch` フォルダで `./install.sh` をもう一度実行してください |
 | `missing tools: …` | 手順 1 のツールをインストールしてください |
 | `need at least two images` | 写真を 2 枚以上指定してください |
 | `images could not all be connected` | 写真の重なりが足りないか、別の面の写真が混ざっています。順番と重なりを確認してください |
