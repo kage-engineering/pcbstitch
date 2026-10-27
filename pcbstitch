@@ -20,7 +20,8 @@ Pipeline
      that still do not fit are pruned and the geometry re-optimised. Frames whose whole area is
      covered by the others are skipped (--keep-redundant keeps them), and photos taken far apart
      in time trigger a warning, since loose parts may have moved.
-  4. photometric: exposure + vignetting + camera response (as Hugin's GUI does).
+  4. photometric: exposure + camera response, so the anchor keeps its developed colours exactly.
+     Vignetting is only corrected with --vignetting (RawTherapee's lens profile already does it).
   5. blending: for images in a row/column, seams are routed through areas where the overlapping
      images agree, every pixel is assigned to exactly one image, and the layers are feathered
      along the seams (avoids broken/ghosted cables and parts that moved); other layouts fall back
@@ -532,6 +533,9 @@ def main():
     ap.add_argument("--detail", type=Path, nargs="+", action="extend", default=[], metavar="IMAGE",
                     help="extra close-up/re-lit photo(s) used only where they show more detail "
                          "(e.g. chip markings); aligned with the others but not used for the rest")
+    ap.add_argument("--vignetting", action="store_true",
+                    help="also correct vignetting (off by default: raws developed with a lens profile "
+                         "already are; use for photos without lens correction)")
     ap.add_argument("--keep-redundant", action="store_true",
                     help="use every image, even ones fully covered by the others (default: skip them)")
     ap.add_argument("--qa-image", action="store_true", help="also write <name>_qa.jpg marking ghost pixels")
@@ -631,7 +635,10 @@ def main():
 
         step("photometric optimisation")
         # strip images only: detail frames are lit differently and would shift the tone of everything
-        pho = ["Vb0", "Vc0", "Vd0", "Ra0", "Rb0", "Rc0", "Rd0", "Re0"] + [f"Eev{i}" for i in range(1, n_main)]
+        # vignetting is off by default: RawTherapee's lens profile already corrects it, and fitting it
+        # again only reshapes the tone of each frame (the anchor would no longer keep its colours)
+        pho = (["Vb0", "Vc0", "Vd0"] if a.vignetting else []) + ["Ra0", "Rb0", "Rc0", "Rd0", "Re0"] + \
+            [f"Eev{i}" for i in range(1, n_main)]
         run("pto_var", "--opt", ",".join(pho), "-o", "g.pto", "f.pto")
         write_pto(work / "g.pto", set_disabled(read_pto(work / "g.pto"), n_main))
         if run("vig_optimize", "-o", "h.pto", "g.pto", check=False).returncode != 0:

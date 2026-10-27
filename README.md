@@ -126,6 +126,7 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
 | `--rotate 0\|90\|180\|270` | `0` | coarse rotation applied when developing raws |
 | `--redevelop` | off | develop raws again even if PNGs exist |
 | `--detail IMAGE …` | none | extra photo(s), e.g. re-lit or refocused on a chip, used **only** where they show more detail than the stitch (see [Detail frames](#detail-frames-reading-chip-markings)) |
+| `--vignetting` | off | also correct vignetting; only for photos developed without a lens correction |
 | `--keep-redundant` | off | use every image, even ones fully covered by the others |
 | `--qa-image` | off | write `<name>_qa.jpg` |
 | `--keep-temp` | off | keep the work directory (layers, intermediate `.pto` files) |
@@ -162,7 +163,7 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
    - Then up to three rounds of: compute each point's residual in source-image pixels, drop points above max(3 px, 3× median), re-optimise.
    - **Session check:** if the photos' EXIF capture times span more than an hour, it warns and lists them, because loose parts may have moved in between.
    - **Redundant frames:** with three or more images, each image's outline is projected onto the panorama. An image whose area is at least 97% covered by the others is skipped and reported, and steps 2–4 run again without it. It never drops the anchor; it prefers to drop a frame taken furthest in time from the others, then the least sharp one. `--keep-redundant` turns this off.
-5. **Optimise photometrics** (`vig_optimize`): exposure of each non-anchor image, plus vignetting (`Vb Vc Vd`) and the camera response curve (`Ra…Re`). Detail frames are aligned in steps 2–4 like the others, but are marked `disabled` for this step. They're then given the strip's exposure, and the output exposure `E` is set to the strip's mean.
+5. **Optimise photometrics** (`vig_optimize`): exposure of each non-anchor image and the camera response curve (`Ra…Re`). Vignetting (`Vb Vc Vd`) is only fitted with `--vignetting`, because the lens profile in RawTherapee already corrects it ([why](#photometrics)). The anchor frame keeps its developed colours exactly. Detail frames are aligned in steps 2–4 like the others, but are marked `disabled` for this step. They're then given the strip's exposure, and the output exposure `E` is set to the strip's mean.
 6. **Set up output** (`pano_modify`): rectilinear projection, automatic FOV and canvas, autocrop.
 7. **Render** each image as its own full-canvas layer (`nona -m TIFF_m`).
 8. **Blend**:
@@ -257,6 +258,29 @@ Leaving out the response curve (`Ra…Re`) gave visibly darker, more contrasty o
 references. Optimising exposure, vignetting **and** response, as the GUI does, brought overall
 brightness to within 1–5 levels of the references, and in several sets matched the two layers
 to each other better than the references did.
+
+**Colour accuracy, and why vignetting is now off by default.** A later check compared each
+stitch with the developed photos themselves. The anchor frame was rendered twice into the
+output canvas: once with the fitted photometrics, and once neutral (geometry only, which
+reproduces the source PNG to within 0.2 levels).
+
+- **What vignetting correction did.** White balance (B−G and R−G on the white background, within
+  0.5 levels) and saturation (within 1%) were preserved. But every frame got darker towards its
+  edges: about 1 level overall and 2–3 at the edges on one board, and about 2.5 overall and
+  4–6 in midtones on the other. The anchor's exposure equals the output exposure, so this was
+  entirely Hugin's vignetting correction. RawTherapee's lens profile (`UseVignette=true`)
+  already corrects the lens, so Hugin was correcting a second time and fitting uneven lighting
+  instead.
+- **Without it.** Fitting only exposure and response makes the anchor frame **identical** to the
+  developed photo: 0.0 levels difference, white balance and background unchanged.
+- **Seams.** Overlap brightness matching changed by under about 1 level on average. A
+  background brightness profile along both sides of the image showed no new seam steps (front
+  p99 3.1/8.2 vs 2.9/8.1 levels; back max 11.8/13.1 vs 9.2/16.7, where the large values are
+  object edges). Ghosting was unchanged.
+
+So vignetting is off by default; `--vignetting` turns it back on for photos developed without a
+lens correction. Every other frame still gets an exposure (gain) adjustment so that it matches
+the anchor.
 
 ### Blending: why seams are routed outside enblend
 
@@ -470,7 +494,8 @@ Things that made stitching harder in practice:
 | `skipping X: its whole area is covered` | X added no new area, so it was left out. Usually an extra shot passed by mistake. If X was taken to show detail (e.g. chip markings), pass it with `--detail X` instead; `--keep-redundant` would blend it in everywhere. |
 | `X: no area with more detail than the stitch; not used` | the `--detail` frame didn't show clearly more fine detail anywhere, or only where things had moved. Check that it really shows the markings better, and that it covers the chip. |
 | Board appears rotated | raws: `--rotate 90/180/270` (applied at development; use `--redevelop` if PNGs exist). |
-| `photometric optimisation failed` | too few points for vig_optimize; the stitch continues without exposure and vignetting correction. |
+| `photometric optimisation failed` | too few points for vig_optimize; the stitch continues without exposure correction. |
+| Frames get darker towards their edges, with visible bands | the photos weren't developed with a lens (vignetting) correction. Add `--vignetting`. |
 | 2D grid of shots | `auto` falls back to enblend; check the result for ghosting. |
 | Want to edit in the Hugin GUI | open `<name>_stitched.pto`. Hugin renders it with enblend, not the routed seams. |
 
