@@ -48,6 +48,17 @@ You need these on your `PATH`:
 
 On Arch / CachyOS: `pacman -S hugin enblend-enfuse rawtherapee uv`.
 
+**One-step setup**, the easiest way. It installs all of the above with your package manager,
+clones to `~/pcbstitch` (or `$PCBSTITCH_DIR`), runs `install.sh` and does a test run:
+```
+curl -fsSL https://raw.githubusercontent.com/kage-engineering/pcbstitch/main/setup.sh | bash
+```
+It supports pacman (Arch / CachyOS / Manjaro), apt (Ubuntu / Debian / Mint), dnf (Fedora) and
+zypper (openSUSE). Messages are in Japanese when the system language is Japanese. Re-running it
+updates the checkout.
+
+**Manual:**
+
 ```
 git clone https://github.com/kage-engineering/pcbstitch.git
 cd pcbstitch && ./install.sh

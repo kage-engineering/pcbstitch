@@ -6,7 +6,19 @@
 
 ## 1. Install (once)
 
-The steps below are for Linux.
+Open a terminal, paste this line and press Enter:
+```
+curl -fsSL https://raw.githubusercontent.com/kage-engineering/pcbstitch/main/setup.sh | bash
+```
+- **Password:** if something needs installing, it asks for your password. Nothing appears
+  while you type it; that's normal, just type it and press Enter.
+- **What it does:** installs everything needed, puts pcbstitch in `~/pcbstitch`, and does a
+  test run. It works on Arch/CachyOS, Ubuntu/Debian, Fedora and openSUSE.
+- **When it says "All done!"**, close the terminal, open a new one and try `pcbstitch --help`.
+- **To update later,** run the same line again.
+
+<details>
+<summary>Manual install (if you prefer to do it step by step)</summary>
 
 **Arch / CachyOS**
 ```
@@ -36,6 +48,8 @@ The first real run takes a little longer, because it downloads a few Python pack
 
 To update later: `cd pcbstitch && git pull` (no need to reinstall).
 To remove: `./install.sh --uninstall`.
+
+</details>
 
 ## 2. Take the photos
 

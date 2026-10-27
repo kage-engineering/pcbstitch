@@ -6,7 +6,17 @@
 
 ## 1. インストール(最初の 1 回だけ)
 
-以下は Linux での手順です。
+ターミナルを開き、次の 1 行を貼り付けて Enter を押してください。
+```
+curl -fsSL https://raw.githubusercontent.com/kage-engineering/pcbstitch/main/setup.sh | bash
+```
+- **パスワード:** インストールが必要なものがあると、パスワードを聞かれます。入力中は何も表示されませんが、正常です。そのまま入力して Enter を押してください。
+- **やること:** 必要なものをすべてインストールし、pcbstitch を `~/pcbstitch` に置いて、テスト実行まで行います。Arch/CachyOS、Ubuntu/Debian、Fedora、openSUSE で使えます。
+- **「完了しました!」と表示されたら**、ターミナルを閉じて新しいターミナルを開き、`pcbstitch --help` を試してください。
+- **後で更新するとき**は、同じ 1 行をもう一度実行してください。
+
+<details>
+<summary>手動でインストールする場合(1 ステップずつ行いたい人向け)</summary>
 
 **Arch / CachyOS**
 ```
@@ -35,6 +45,8 @@ pcbstitch --help
 
 更新するとき: `cd pcbstitch && git pull`(再インストールは不要です)。
 削除するとき: `./install.sh --uninstall`。
+
+</details>
 
 ## 2. 写真を撮る
 
