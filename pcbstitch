@@ -1,0 +1,510 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["numpy", "opencv-python-headless", "pillow"]
+# ///
+"""
+pcbstitch - stitch overlapping close-up photos of a flat object (PCBs) with Hugin.
+
+Takes the photos of one side of a board (raws or PNG/TIFF/JPEG), optionally develops raws with
+RawTherapee, and produces <name>_stitched.png plus the Hugin project (.pto) and a log.
+
+Pipeline
+  1. raw -> PNG with rawtherapee-cli using your default raw profile (and .pp3 sidecars if present)
+  2. Hugin project as a flat mosaic: rectilinear, the anchor image fixed, the others get
+     roll/pitch/yaw + X/Y/Z translation. HFOV comes from the EXIF focal length and the crop factor
+     and is held fixed (it is degenerate with Z translation on a flat scene and drifts otherwise).
+  3. control points: cpfind (4x the default density), cpclean, then per image pair only points
+     consistent with one planar homography are kept (removes parallax on tall parts and objects
+     that moved between shots), weak redundant pairs are dropped, and after optimising, points
+     that still do not fit are pruned and the geometry re-optimised.
+  4. photometric: exposure + vignetting + camera response (as Hugin's GUI does).
+  5. blending: for images in a row/column, seams are routed through areas where the overlapping
+     images agree and the layers are feathered along them (avoids broken/ghosted cables and
+     parts that moved); other layouts fall back to enblend. --blend chooses explicitly.
+  6. output cropped to Hugin's autocrop, ICC profile + EXIF copied from the anchor image,
+     and a QA line: control-point error and pixels that match none of the source images.
+
+Requires on PATH: Hugin tools (pto_gen cpfind cpclean pto_var autooptimiser vig_optimize
+pano_modify nona pano_trafo checkpto), enblend (only for --blend enblend) and rawtherapee-cli
+(only for raw input).
+
+Examples
+  pcbstitch ~/Pictures/board/front*.ARW                      # -> ~/Pictures/board/stitched/front_stitched.png
+  pcbstitch PCB/PCB2/back/png/*.png                          # -> PCB/PCB2/back/stitched/PCB_PCB2_back_stitched.png
+  pcbstitch --name shin_back back2.ARW back3.ARW back1.ARW
+"""
+import argparse, glob, math, os, re, shutil, struct, subprocess, sys, tempfile, zlib
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
+
+RAW_EXT = {".arw", ".nef", ".cr2", ".cr3", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"}
+HUGIN_TOOLS = ["pto_gen", "cpfind", "cpclean", "pto_var", "autooptimiser", "vig_optimize",
+               "pano_modify", "nona", "pano_trafo", "checkpto"]
+
+
+def die(msg):
+    sys.exit(f"pcbstitch: error: {msg}")
+
+
+def step(msg):
+    print(f"• {msg}", flush=True)
+
+
+class Runner:
+    """Runs external tools in the work dir, appending their output to the log."""
+    def __init__(self, workdir, log):
+        self.workdir, self.log = workdir, log
+
+    def __call__(self, *cmd, check=True, input=None):
+        self.log.write(f"\n$ {' '.join(map(str, cmd))}\n"); self.log.flush()
+        r = subprocess.run(list(map(str, cmd)), cwd=self.workdir, input=input, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.log.write(r.stdout); self.log.flush()
+        if check and r.returncode != 0:
+            die(f"{cmd[0]} failed (exit {r.returncode}); see the log for details")
+        return r
+
+
+# ----------------------------------------------------------------------------- raw conversion
+
+def develop_raws(raws, png_dir, rotate, force):
+    png_dir.mkdir(parents=True, exist_ok=True)
+    todo = [r for r in raws if force or not (png_dir / (r.stem + ".png")).exists()
+            or (png_dir / (r.stem + ".png")).stat().st_mtime < r.stat().st_mtime]
+    if todo:
+        step(f"developing {len(todo)} raw file(s) with RawTherapee -> {png_dir}")
+        cmd = ["rawtherapee-cli", "-o", str(png_dir), "-d", "-s"]
+        rot = None
+        if rotate:
+            rot = tempfile.NamedTemporaryFile("w", suffix=".pp3", delete=False)
+            rot.write(f"[Coarse Transformation]\nRotate={rotate}\n"); rot.close()
+            cmd += ["-p", rot.name]
+        cmd += ["-n", "-b8", "-Y", "-c"] + [str(r) for r in todo]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if rot: os.unlink(rot.name)
+        if r.returncode != 0:
+            die("rawtherapee-cli failed:\n" + r.stdout[-2000:])
+    else:
+        step(f"using existing PNGs in {png_dir} (use --redevelop to redo)")
+    return [png_dir / (r.stem + ".png") for r in raws]
+
+
+# ----------------------------------------------------------------------------- pto helpers
+
+def read_pto(path):
+    return Path(path).read_text().split("\n")
+
+
+def write_pto(path, lines):
+    Path(path).write_text("\n".join(lines))
+
+
+def parse_cp(line):
+    f = {t[0]: t[1:] for t in line.split()[1:]}
+    return int(f["n"]), int(f["N"]), float(f["x"]), float(f["y"]), float(f["X"]), float(f["Y"])
+
+
+def cp_lines(lines):
+    return [(i, parse_cp(l)) for i, l in enumerate(lines) if l.startswith("c ")]
+
+
+def p_line_crop(lines):
+    p = next(l for l in lines if l.startswith("p "))
+    m = re.search(r"\bS(\d+),(\d+),(\d+),(\d+)", p)
+    return tuple(map(int, m.groups())) if m else None
+
+
+def hfov_from_exif(img, crop_factor, focal_override):
+    im = Image.open(img)
+    w, h = im.size
+    focal = focal_override
+    if focal is None:
+        focal = im.getexif().get_ifd(0x8769).get(37386)
+        if focal is None:
+            die(f"{img} has no focal length in EXIF; pass --focal or --fov")
+    sensor_w = 36.0 / crop_factor * w / max(w, h)   # long side of the sensor is 36mm/crop
+    return 2 * math.degrees(math.atan(sensor_w / (2 * float(focal))))
+
+
+# ----------------------------------------------------------------------------- control points
+
+def ransac_filter(src, dst, thresh, log):
+    """Per image pair keep only points consistent with one planar homography,
+    then drop weak pairs (<20% of the strongest) if the images stay connected without them."""
+    lines = read_pto(src)
+    pairs = {}
+    for i, (n, N, x, y, X, Y) in cp_lines(lines):
+        pairs.setdefault((n, N), []).append((i, (x, y, X, Y)))
+    drop = set()
+    for p, v in pairs.items():
+        if len(v) < 8:
+            continue
+        a = np.float32([c for _, c in v])
+        H, m = cv2.findHomography(np.ascontiguousarray(a[:, :2]), np.ascontiguousarray(a[:, 2:]),
+                                  cv2.RANSAC, thresh, maxIters=5000, confidence=0.999)
+        if H is None or m.sum() < 6:
+            continue
+        drop |= {v[k][0] for k in np.where(m.ravel() == 0)[0]}
+        log.write(f"pair {p}: kept {int(m.sum())}/{len(v)} planar-consistent points\n")
+    count = {p: sum(1 for i, _ in v if i not in drop) for p, v in pairs.items()}
+    nodes = {x for p in count for x in p}
+
+    def connected(ps):
+        seen, grow = {min(nodes)}, True
+        while grow:
+            grow = False
+            for a, b in ps:
+                if (a in seen) != (b in seen):
+                    seen |= {a, b}; grow = True
+        return seen == nodes
+
+    keep = set(count)
+    strongest = max(count.values())
+    for p in sorted(count, key=count.get):
+        if count[p] < 0.2 * strongest and connected(keep - {p}):
+            keep.discard(p)
+            log.write(f"dropping weak pair {p} ({count[p]} points)\n")
+    for p, v in pairs.items():
+        if p not in keep:
+            drop |= {i for i, _ in v}
+    write_pto(dst, [l for i, l in enumerate(lines) if i not in drop])
+    return len(cp_lines(lines)) - len(drop), connected(keep)
+
+
+def trafo(run, pto, img, pts, reverse=False):
+    inp = "\n".join(f"{x} {y}" for x, y in pts) + "\n"
+    r = subprocess.run(["pano_trafo"] + (["-r"] if reverse else []) + [str(pto), str(img)],
+                       input=inp, capture_output=True, text=True, cwd=run.workdir, check=True)
+    return np.array(r.stdout.split(), float).reshape(-1, 2)
+
+
+def cp_residuals(run, pto):
+    """Residual of every control point in source-image pixels (map n -> panorama -> N)."""
+    lines = read_pto(Path(run.workdir) / pto)
+    cps = cp_lines(lines)
+    fwd = np.zeros((len(cps), 2))
+    for img in {c[1][0] for c in cps}:
+        idx = [k for k, c in enumerate(cps) if c[1][0] == img]
+        fwd[idx] = trafo(run, pto, img, [cps[k][1][2:4] for k in idx])
+    back = np.zeros_like(fwd)
+    for img in {c[1][1] for c in cps}:
+        idx = [k for k, c in enumerate(cps) if c[1][1] == img]
+        back[idx] = trafo(run, pto, img, fwd[idx], reverse=True)
+    target = np.array([c[1][4:6] for c in cps])
+    return lines, cps, np.linalg.norm(back - target, axis=1)
+
+
+def prune(run, src, dst, log):
+    lines, cps, err = cp_residuals(run, src)
+    med = float(np.median(err)); lim = max(3.0, 3 * med)
+    bad = {cps[k][0] for k in np.where(err > lim)[0]}
+    # never leave an image pair with fewer than 6 points
+    by_pair = {}
+    for k, (i, c) in enumerate(cps):
+        by_pair.setdefault(c[:2], []).append((err[k], i))
+    for v in by_pair.values():
+        if sum(1 for _, i in v if i not in bad) < 6:
+            for _, i in sorted(v)[:6]:
+                bad.discard(i)
+    write_pto(Path(run.workdir) / dst, [l for i, l in enumerate(lines) if i not in bad])
+    log.write(f"prune: median residual {med:.2f}px, limit {lim:.2f}px, dropped {len(bad)}/{len(cps)}\n")
+    return len(bad)
+
+
+# ----------------------------------------------------------------------------- blending
+
+def load_layers(files):
+    layers = [cv2.imread(f, cv2.IMREAD_UNCHANGED) for f in files]
+    for f, l in zip(files, layers):
+        if l is None or l.ndim != 3 or l.shape[2] != 4:
+            die(f"unexpected layer format from nona: {f}")
+    return layers
+
+
+def strip_axis(alphas):
+    """'v' if images are stacked top-to-bottom, 'h' if left-to-right, None for a 2D layout."""
+    c = np.array([[np.nonzero(a)[1].mean(), np.nonzero(a)[0].mean()] for a in alphas])
+    if len(c) == 2:
+        d = np.abs(c[1] - c[0])
+        return "v" if d[1] >= d[0] else "h"
+    sx, sy = c[:, 0].std(), c[:, 1].std()
+    primary, secondary = max(sx, sy), min(sx, sy)
+    if secondary > 0.35 * primary:
+        return None
+    return "v" if sy >= sx else "h"
+
+
+def seam_blend(layers, band, log):
+    """Seams between consecutive layers (top to bottom) routed through the cheapest path where the
+    layers agree, then a feathered composite. Works on vertical stacks; callers transpose for rows."""
+    maxv = 65535 if layers[0].dtype == np.uint16 else 255
+    # full-coverage pixels only, minus the resampled boundary
+    A = [cv2.erode((l[:, :, 3] == maxv).astype(np.uint8), np.ones((5, 5))) > 0 for l in layers]
+    H, W = A[0].shape
+    order = sorted(range(len(layers)), key=lambda i: np.nonzero(A[i])[0].mean())
+    s = 4
+    small = [cv2.resize(l[:, :, :3], (W // s, H // s), interpolation=cv2.INTER_AREA).astype(np.float32)
+             * (255.0 / maxv) for l in layers]
+    smallA = [cv2.resize(a.astype(np.uint8), (W // s, H // s), interpolation=cv2.INTER_NEAREST) > 0 for a in A]
+    keep = [a.copy() for a in A]
+    yy = np.arange(H)[:, None]
+    for u, d in zip(order, order[1:]):
+        ov = cv2.erode((smallA[u] & smallA[d]).astype(np.uint8), np.ones((5, 5))) > 0
+        if not ov.any():
+            log.write(f"seam: layers {u} and {d} do not overlap\n")
+            continue
+        diff = cv2.GaussianBlur(np.abs(small[u] - small[d]).max(2), (0, 0), 2)
+        cost = np.where(ov, diff + 1.0, 1e6)
+        cols = np.where(ov.any(0))[0]
+        x0, x1 = cols[0], cols[-1]
+        cost[:, ~ov.any(0)] = 1.0                    # columns without overlap: free
+        h = cost.shape[0]
+        acc = cost[:, x0].astype(np.float64)
+        back = np.zeros((h, x1 - x0 + 1), np.int8)
+        for j, x in enumerate(range(x0 + 1, x1 + 1), start=1):
+            cand = np.stack([np.r_[np.inf, acc[:-1]], acc, np.r_[acc[1:], np.inf]])
+            k = cand.argmin(0)
+            acc = cand[k, np.arange(h)] + cost[:, x]
+            back[:, j] = k - 1
+        path = np.zeros(W // s, int)
+        r = int(acc.argmin())
+        for j in range(x1 - x0, -1, -1):
+            path[x0 + j] = r
+            r += int(back[r, j])
+        path[:x0] = path[x0]; path[x1 + 1:] = path[x1]
+        seam = np.interp(np.arange(W), np.arange(W // s) * s + s / 2, path * s + s / 2)[None, :]
+        on = float(np.mean(diff[path[cols], cols]))
+        log.write(f"seam layers {u}/{d}: mean |diff| on seam {on:.1f}, overlap mean {diff[ov].mean():.1f}\n")
+        keep[u] &= (yy < seam + band) | ~A[d]      # trim only where the other layer covers
+        keep[d] &= (yy > seam - band) | ~A[u]
+    num = np.zeros((H, W, 3), np.float32)
+    den = np.zeros((H, W), np.float32)
+    for l, k, a in zip(layers, keep, A):
+        w = cv2.GaussianBlur(k.astype(np.float32), (0, 0), band / 2) * a
+        num += l[:, :, :3].astype(np.float32) * w[:, :, None]
+        den += w
+    rgb = np.clip(num / np.maximum(den, 1e-6)[:, :, None] + 0.5, 0, maxv).astype(layers[0].dtype)
+    alpha = np.where(den > 1e-3, maxv, 0).astype(layers[0].dtype)
+    return np.dstack([rgb, alpha])
+
+
+def ghost_check(out, layers, crop_xy, qa_image=None):
+    """Pixels of the result that match none of the source layers covering them."""
+    x0, y0 = crop_xy
+    h, w = out.shape[:2]
+    scale = 255.0 / (65535 if out.dtype == np.uint16 else 255)
+    O = out[:, :, :3].astype(np.float32) * scale
+    best = np.full((h, w), 255, np.float32)
+    for l in layers:
+        L = l[y0:y0 + h, x0:x0 + w]
+        m = L[:, :, 3] > 0
+        d = cv2.blur(np.abs(L[:, :, :3].astype(np.float32) * scale - O).max(2), (5, 5))
+        best = np.where(m, np.minimum(best, d), best)
+    bad = cv2.morphologyEx((best > 40).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5)))
+    n, _, st, _ = cv2.connectedComponentsWithStats(bad)
+    blobs = [st[i] for i in range(1, n) if st[i][4] > 400]
+    if qa_image:
+        vis = cv2.resize((O).astype(np.uint8), None, fx=0.2, fy=0.2, interpolation=cv2.INTER_AREA)
+        r = cv2.dilate(cv2.resize(bad * 255, (vis.shape[1], vis.shape[0])), np.ones((7, 7)))
+        vis[r > 0] = (0, 0, 255)
+        cv2.imwrite(str(qa_image), vis)
+    return int(bad.sum()), len(blobs)
+
+
+# ----------------------------------------------------------------------------- output
+
+def png_chunk(typ, data):
+    return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+
+
+def add_png_metadata(path, source):
+    """Copy ICC profile and EXIF from the source image into the PNG (no re-encode)."""
+    info = Image.open(source).info
+    chunks = b""
+    if info.get("icc_profile"):
+        chunks += png_chunk(b"iCCP", b"ICC profile\0\0" + zlib.compress(info["icc_profile"]))
+    exif = info.get("exif")
+    if exif:
+        chunks += png_chunk(b"eXIf", exif[6:] if exif.startswith(b"Exif\0\0") else exif)
+    if not chunks:
+        return
+    data = Path(path).read_bytes()
+    pos = 8 + 12 + struct.unpack(">I", data[8:12])[0]       # right after IHDR
+    Path(path).write_bytes(data[:pos] + chunks + data[pos:])
+
+
+def default_name(images):
+    stems = [p.stem for p in images]
+    prefix = os.path.commonprefix(stems)
+    name = re.sub(r"[-_ ]*\d*$", "", prefix) or re.sub(r"[-_ ]*\d+$", "", stems[0]) or "pano"
+    return name
+
+
+def default_outdir(images):
+    d = images[0].resolve().parent
+    return d.parent / "stitched" if d.name.lower() == "png" else d / "stitched"
+
+
+# ----------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip(),
+                                 epilog=__doc__[__doc__.index("Examples"):],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("images", nargs="+", type=Path,
+                    help="photos of one side, in order along the strip (raw or PNG/TIFF/JPEG)")
+    ap.add_argument("-o", "--outdir", type=Path, help="output directory (default: <set>/stitched)")
+    ap.add_argument("-n", "--name", help="output name; writes <name>_stitched.png (default: from file names)")
+    ap.add_argument("--anchor", type=int, help="index of the image that stays fixed (default: the middle one)")
+    ap.add_argument("--crop-factor", type=float, default=1.5, help="sensor crop factor (default 1.5, APS-C)")
+    ap.add_argument("--focal", type=float, help="focal length in mm (default: from EXIF)")
+    ap.add_argument("--fov", type=float, help="horizontal field of view in degrees (overrides focal/crop)")
+    ap.add_argument("--blend", choices=["auto", "seams", "enblend"], default="auto",
+                    help="auto: routed seams for images in a row/column, enblend otherwise")
+    ap.add_argument("--band", type=int, default=24, help="seam feather width in pixels (default 24)")
+    ap.add_argument("--points", type=int, default=4,
+                    help="cpfind density: points per pair = 25 x this (default 4)")
+    ap.add_argument("--ransac-px", type=float, default=3.0, help="planar consistency threshold (default 3px)")
+    ap.add_argument("--png-dir", type=Path, help="where developed raws go (default: <raw dir>/png)")
+    ap.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
+                    help="coarse rotation when developing raws")
+    ap.add_argument("--redevelop", action="store_true", help="re-develop raws even if PNGs exist")
+    ap.add_argument("--qa-image", action="store_true", help="also write <name>_qa.jpg marking ghost pixels")
+    ap.add_argument("--keep-temp", action="store_true", help="keep the work directory")
+    a = ap.parse_args()
+
+    images = [p.expanduser().resolve() for p in a.images]
+    for p in images:
+        if not p.is_file():
+            die(f"no such file: {p}")
+    if len(images) < 2:
+        die("need at least two images")
+    raws = [p for p in images if p.suffix.lower() in RAW_EXT]
+    if raws and len(raws) != len(images):
+        die("mix of raw and non-raw input; pass one kind")
+    tools = HUGIN_TOOLS + (["rawtherapee-cli"] if raws else []) + (["enblend"] if a.blend != "seams" else [])
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        die("missing tools: " + ", ".join(missing))
+
+    name = a.name or default_name(images)
+    if raws:
+        images = develop_raws(raws, (a.png_dir or raws[0].parent / "png").expanduser().resolve(),
+                              a.rotate, a.redevelop)
+    outdir = (a.outdir or default_outdir(images)).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    base = f"{name}_stitched"
+    out_png, out_pto, out_log = outdir / f"{base}.png", outdir / f"{base}.pto", outdir / f"{base}.log"
+
+    anchor = a.anchor if a.anchor is not None else (len(images) - 1) // 2
+    if not 0 <= anchor < len(images):
+        die("--anchor out of range")
+    ordered = [images[anchor]] + [p for i, p in enumerate(images) if i != anchor]   # anchor is image 0
+    n = len(ordered)
+
+    work = Path(tempfile.mkdtemp(prefix="pcbstitch-"))
+    log = open(out_log, "w")
+    run = Runner(work, log)
+    print(f"{base}: {n} images, anchor {ordered[0].name} -> {out_png}")
+    try:
+        fov = a.fov or hfov_from_exif(ordered[0], a.crop_factor, a.focal)
+        step(f"project (HFOV {fov:.2f}°)")
+        run("pto_gen", "-f", f"{fov:.6f}", "-o", "a.pto", *ordered)
+
+        step("control points")
+        run("cpfind", "--multirow", "--sieve2size", a.points, "-o", "b.pto", "a.pto")
+        run("cpclean", "-o", "c.pto", "b.pto")
+        kept, ok = ransac_filter(work / "c.pto", work / "d.pto", a.ransac_px, log)
+        if not ok or kept == 0:
+            die("images could not all be connected by control points; check overlap/order")
+
+        step("geometric optimisation")
+        geo = ["b0"] + [f"{v}{i}" for i in range(1, n) for v in ("r", "p", "y", "TrX", "TrY", "TrZ")]
+        run("pto_var", "--opt", ",".join(geo), "-o", "e.pto", "d.pto")
+        run("autooptimiser", "-n", "-o", "f.pto", "e.pto")
+        for _ in range(3):
+            if prune(run, "f.pto", "f2.pto", log) == 0:
+                break
+            run("autooptimiser", "-n", "-o", "f.pto", "f2.pto")
+
+        step("photometric optimisation")
+        pho = ["Vb0", "Vc0", "Vd0", "Ra0", "Rb0", "Rc0", "Rd0", "Re0"] + [f"Eev{i}" for i in range(1, n)]
+        run("pto_var", "--opt", ",".join(pho), "-o", "g.pto", "f.pto")
+        if run("vig_optimize", "-o", "h.pto", "g.pto", check=False).returncode != 0:
+            print("  warning: photometric optimisation failed; continuing without it")
+            shutil.copy(work / "g.pto", work / "h.pto")
+        run("pano_modify", "--projection=0", "--fov=AUTO", "--canvas=AUTO", "--crop=AUTO",
+            "--output-type=NORMAL", "--ldr-file=PNG", "-o", "final.pto", "h.pto")
+
+        final = read_pto(work / "final.pto")
+        crop = p_line_crop(final)
+        # full-canvas copy for rendering separate layers
+        full = [re.sub(r" S\d+,\d+,\d+,\d+", "", l).replace(" r:CROP", "") if l.startswith("p ") else l
+                for l in final]
+        write_pto(work / "full.pto", full)
+
+        step("rendering layers")
+        run("nona", "-m", "TIFF_m", "-o", "layer", "full.pto")
+        files = sorted(glob.glob(str(work / "layer*.tif")))
+        layers = load_layers(files)
+
+        mode = a.blend
+        axis = strip_axis([l[:, :, 3] > 0 for l in layers])
+        if mode == "auto":
+            mode = "seams" if axis else "enblend"
+        if mode == "seams" and axis is None:
+            print("  warning: images are not in a single row/column; seams may be poor (try --blend enblend)")
+            axis = "v"
+        step(f"blending ({'routed seams' if mode == 'seams' else 'enblend'})")
+        if mode == "seams":
+            if axis == "h":
+                res = seam_blend([np.ascontiguousarray(l.transpose(1, 0, 2)) for l in layers], a.band, log)
+                res = np.ascontiguousarray(res.transpose(1, 0, 2))
+            else:
+                res = seam_blend(layers, a.band, log)
+            margin = 4      # boundary pixels were dropped; keep the crop fully covered
+        else:
+            run("enblend", "-o", "blend.tif", *files)
+            res = cv2.imread(str(work / "blend.tif"), cv2.IMREAD_UNCHANGED)
+            margin = 2      # nona leaves partially covered pixels on the layer boundaries
+        if crop:
+            l, r, t, b = crop
+            l, r, t, b = l + margin, r - margin, t + margin, b - margin
+        else:
+            l, t, b, r = 0, 0, res.shape[0], res.shape[1]
+        out = res[t:b, l:r]
+
+        maxv = 65535 if out.dtype == np.uint16 else 255
+        holes = int((out[:, :, 3] < maxv).sum())
+        cv2.imwrite(str(out_png), out, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+        add_png_metadata(out_png, ordered[0])
+
+        # project file next to the result, image paths relative like Hugin writes them
+        rel = [re.sub(r'n"([^"]+)"', lambda m: f'n"{os.path.relpath(m.group(1), outdir)}"', x)
+               if x.startswith("i ") else x for x in final]
+        write_pto(out_pto, rel)
+
+        cp = run("checkpto", out_pto).stdout
+        mean = re.search(r"Mean error\s*:\s*([\d.]+)", cp); mx = re.search(r"Maximum\s*:\s*([\d.]+)", cp)
+        npts = re.search(r"(\d+) control points", cp)
+        ghosts, blobs = ghost_check(out, layers, (l, t), outdir / f"{name}_qa.jpg" if a.qa_image else None)
+        print(f"done: {out_png.name} {out.shape[1]}x{out.shape[0]}")
+        print(f"  control points {npts.group(1) if npts else '?'}, mean error {mean.group(1) if mean else '?'}px, "
+              f"max {mx.group(1) if mx else '?'}px")
+        print(f"  ghost pixels {ghosts} in {blobs} region(s)" + (f"; {holes} transparent pixels" if holes else ""))
+        if mode == "seams":
+            print("  note: the .pto holds the alignment; opening it in Hugin renders with enblend, not routed seams")
+    finally:
+        log.close()
+        if a.keep_temp:
+            print(f"  work directory kept: {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
