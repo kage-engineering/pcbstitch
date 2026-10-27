@@ -91,6 +91,7 @@ pcbstitch PCB/PCB2/back/png/*.png                   # result -> PCB/PCB2/back/st
 pcbstitch --name board_back back3.ARW back2.ARW back1.ARW
 pcbstitch --rotate 180 *.ARW                        # board was shot upside down
 pcbstitch --blend enblend --qa-image a.png b.png    # Hugin's normal blender + QA overlay
+pcbstitch front1.ARW front2.ARW front3.ARW --detail IC.ARW   # extra shot lit to read chip markings
 ```
 
 ### Outputs
@@ -124,6 +125,7 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
 | `--png-dir DIR` | `<raw dir>/png` | where developed raws go |
 | `--rotate 0\|90\|180\|270` | `0` | coarse rotation applied when developing raws |
 | `--redevelop` | off | develop raws again even if PNGs exist |
+| `--detail IMAGE …` | none | extra photo(s), e.g. re-lit or refocused on a chip, used **only** where they show more detail than the stitch (see [Detail frames](#detail-frames-reading-chip-markings)) |
 | `--keep-redundant` | off | use every image, even ones fully covered by the others |
 | `--qa-image` | off | write `<name>_qa.jpg` |
 | `--keep-temp` | off | keep the work directory (layers, intermediate `.pto` files) |
@@ -160,16 +162,19 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
    - Then up to three rounds of: compute each point's residual in source-image pixels, drop points above max(3 px, 3× median), re-optimise.
    - **Session check:** if the photos' EXIF capture times span more than an hour, it warns and lists them, because loose parts may have moved in between.
    - **Redundant frames:** with three or more images, each image's outline is projected onto the panorama. An image whose area is at least 97% covered by the others is skipped and reported, and steps 2–4 run again without it. It never drops the anchor; it prefers to drop a frame taken furthest in time from the others, then the least sharp one. `--keep-redundant` turns this off.
-5. **Optimise photometrics** (`vig_optimize`): exposure of each non-anchor image, plus vignetting (`Vb Vc Vd`) and the camera response curve (`Ra…Re`).
+5. **Optimise photometrics** (`vig_optimize`): exposure of each non-anchor image, plus vignetting (`Vb Vc Vd`) and the camera response curve (`Ra…Re`). Detail frames are aligned in steps 2–4 like the others, but are marked `disabled` for this step. They're then given the strip's exposure, and the output exposure `E` is set to the strip's mean.
 6. **Set up output** (`pano_modify`): rectilinear projection, automatic FOV and canvas, autocrop.
 7. **Render** each image as its own full-canvas layer (`nona -m TIFF_m`).
 8. **Blend**:
    - **seams** (a single row or column): for each neighbouring pair, find the cheapest left-to-right path through the overlap, where cost is how much the two layers differ. Each pixel is then assigned to **exactly one** layer: the one whose band between seams contains it, or else the nearest layer in the strip that covers it. The labels are feathered (σ = `band`/2) into the composite.
    - **enblend**: plain `enblend` on the layers, as Hugin itself does.
-9. **Write output**:
-   - Crop to Hugin's autocrop rectangle, shrunk by a few pixels (see below).
+
+   Detail frames are left out of both.
+9. **Patch in detail frames** (`--detail`): paste each one into the regions where it shows clearly more fine detail than the stitch while agreeing with it at a coarse scale. The patch keeps the frame's fine detail but takes the stitch's coarse tone.
+10. **Write output**:
+   - Crop to Hugin's autocrop rectangle, computed over the strip only and shrunk by a few pixels (see below).
    - Write the PNG and insert the `iCCP` and `eXIf` chunks from the anchor image.
-   - Write the `.pto` and print the QA summary.
+   - Write the `.pto`, with any detail frames included but disabled, and print the QA summary.
 
 ---
 
@@ -303,6 +308,48 @@ What fixed it:
   give 1,023 pixels in 1 region, and the shin back set (with the moved cable) went from 1,966
   ghost pixels in 2 regions to 0.
 
+### Detail frames: reading chip markings
+
+Laser-etched chip markings often vanish under the light used for the overview shots. In one
+set, the two MediaTek RF chips looked like plain black squares in all three strip photos. A
+separate shot with different light, taken with the same lens and framing but at another shutter
+speed two days later, showed `MEDIATEK MT7762N 2503-BJCAL AAP51738` and
+`MT7761N 2508-BJCSL AAP53269` clearly. It is not a zoomed or higher-resolution shot; the
+difference is purely lighting.
+
+Treating that shot as a normal frame is wrong: it was skipped as redundant, and when kept, the
+antenna boards that had moved left a fragment. So `--detail` frames are handled separately:
+
+- **Alignment:** same as the strip (they share its control points), so they line up to about 1 px.
+- **Where they're used.** At half resolution, compare fine-detail strength (a blurred high-pass)
+  between the stitch and the detail frame:
+  - The detail frame is first scaled to the stitch's local brightness. Otherwise a brighter
+    frame wins on noise alone: in one run that gave 28 patches over bare board and grainy chip
+    text.
+  - Candidate pixels need more than 1.8× the stitch's detail (plus a small offset) **and** a
+    coarse colour difference of at most 25 levels (σ = 12). The second condition stops a moved
+    green antenna board on white table from ever qualifying.
+  - Each candidate region becomes its convex hull grown by 40 px, so a whole chip top is
+    replaced rather than half of its text. Regions under about 6,000 px are dropped.
+- **How they're pasted.**
+  `detail + blur(stitch, σ=25) − blur(detail, σ=25)`, feathered in with σ = 8. The markings come
+  from the detail frame; brightness and colour come from the stitch, so no rectangle shows.
+
+Pitfalls found while building this:
+
+- **Output exposure.** `pto_gen` sets the panorama's output exposure `E` to the **mean EXIF
+  exposure of all images**. A detail frame at 1/8 s among 1/3 s frames (Eev 9.0 vs 7.58) raised
+  `E` and darkened the whole stitch by about 1.3×. That's also why the first, accidental
+  four-frame run looked darker. `E` is now the strip's mean.
+- **Photometric fit.** Including a differently lit frame in `vig_optimize` shifts the shared
+  response curve for everything (Ra +0.48 instead of about −4). Hugin's `#-hugin … disabled`
+  flag excludes it. A second pass fitting only the detail frame's exposure was tried, but it
+  rendered the frame 1.85× too bright and its noise looked like detail. The detail frame
+  therefore gets the strip's exposure directly; RawTherapee's auto-matched curve has already
+  evened out the PNGs' brightness.
+- **Autocrop.** It runs over all enabled images, and the detail frame reached 4 px past the
+  strip's edge. The crop is computed with detail frames disabled.
+
 ### Edges and cropping
 
 `nona` leaves partly covered, darkened pixels along each layer's boundary:
@@ -399,6 +446,9 @@ Things that made stitching harder in practice:
   others, but it's better not to pass extra shots at all. Running `pcbstitch *.ARW` in a folder
   that also holds a close-up taken another day added that close-up as a fourth frame. The antenna
   boards had moved since, which left a fragment of one in the stitch.
+- **Shoot extra frames for unreadable chips.** If chip markings don't show, take one more shot
+  with the light at a low angle across the chip (or the camera refocused on its top), and pass it
+  with `--detail`. Only the areas where it shows more detail are used.
 - **Retakes.** If you pass both a frame and its retake, the redundancy check drops one of them,
   preferring the less sharp one. In one set the retake was 3–8× less sharp (variance of
   Laplacian) than the original. To check yourself:
@@ -417,7 +467,8 @@ Things that made stitching harder in practice:
 | High mean error (> 2–3 px) | parallax or moved objects dominating. Check `<name>_stitched.log` for how many points the planar filter kept per pair. A lower `--ransac-px` is stricter. |
 | Ghost regions in the summary | use `--qa-image` to see them. Often a tall part or a moved cable inside the overlap with no clean path round it; more overlap or re-shooting helps. Try `--band 12` for a tighter seam. |
 | `photos were taken at different times` | the frames come from different sessions; anything loose may have moved. Prefer frames from one session. |
-| `skipping X: its whole area is covered` | X added no new area, so it was left out. Usually an extra shot passed by mistake. Use `--keep-redundant` to keep it. |
+| `skipping X: its whole area is covered` | X added no new area, so it was left out. Usually an extra shot passed by mistake. If X was taken to show detail (e.g. chip markings), pass it with `--detail X` instead; `--keep-redundant` would blend it in everywhere. |
+| `X: no area with more detail than the stitch; not used` | the `--detail` frame didn't show clearly more fine detail anywhere, or only where things had moved. Check that it really shows the markings better, and that it covers the chip. |
 | Board appears rotated | raws: `--rotate 90/180/270` (applied at development; use `--redevelop` if PNGs exist). |
 | `photometric optimisation failed` | too few points for vig_optimize; the stitch continues without exposure and vignetting correction. |
 | 2D grid of shots | `auto` falls back to enblend; check the result for ghosting. |

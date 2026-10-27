@@ -62,6 +62,9 @@ To remove: `./install.sh --uninstall`.
   good photo of each position.
 - **Shoot one side in one session.** If loose parts are moved between photos (for example,
   photos taken on different days), parts of them can show up twice or cut off.
+- **Check the chip markings.** If you can't read the text on a chip, take one extra photo with
+  the light coming from a low angle across the chip until the text shows. Give it a clear name
+  (for example `IC.ARW`) and add it with `--detail` in step 3.
 
 ## 3. Stitch
 
@@ -78,6 +81,15 @@ You can also pass PNG, TIFF or JPEG files directly.
 shots, such as a close-up of a chip. If you do pass an extra photo that adds nothing new, the
 tool skips it and says so (`skipping …`). If the photos were taken at different times, it shows
 a warning.
+
+**Chip markings unreadable?** Take one extra photo where the markings show, for example with the
+light at a low angle across the chip, and add it with `--detail`:
+```
+pcbstitch front1.ARW front2.ARW front3.ARW --detail IC.ARW
+```
+It is used **only** on the areas where it shows more detail, such as the chip tops. Everything
+else comes from the normal photos, so it's fine if it was taken at another time. The output says
+how many areas it used (`IC.png: used in 6 region(s)`); `--qa-image` outlines them in light blue.
 
 The result goes into a `stitched/` folder:
 ```
@@ -114,6 +126,7 @@ Always look at the image yourself too, especially where the photos overlap.
 | `--name board_front` | choose the output name (`board_front_stitched.png`) |
 | `--qa-image` | save a picture showing problem areas |
 | `-o DIR` | put the result somewhere else |
+| `--detail IC.ARW` | use an extra photo only where it shows more detail, e.g. chip markings |
 
 `pcbstitch --help` lists everything.
 

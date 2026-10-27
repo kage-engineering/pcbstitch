@@ -25,7 +25,10 @@ Pipeline
      images agree, every pixel is assigned to exactly one image, and the layers are feathered
      along the seams (avoids broken/ghosted cables and parts that moved); other layouts fall back
      to enblend. --blend chooses explicitly.
-  6. output cropped to Hugin's autocrop, ICC profile + EXIF copied from the anchor image,
+  6. --detail frames (e.g. a shot lit to show chip markings) are aligned with the rest but only
+     pasted where they show clearly more fine detail than the stitch and agree with it at coarse
+     scale; patches keep their fine detail and take the stitch's tone.
+  7. output cropped to Hugin's autocrop, ICC profile + EXIF copied from the anchor image,
      and a QA line: control-point error and pixels that match none of the source images.
 
 Requires on PATH: Hugin tools (pto_gen cpfind cpclean pto_var autooptimiser vig_optimize
@@ -36,6 +39,7 @@ Examples
   pcbstitch ~/Pictures/board/front*.ARW                      # -> ~/Pictures/board/stitched/front_stitched.png
   pcbstitch PCB/PCB2/back/png/*.png                          # -> PCB/PCB2/back/stitched/PCB_PCB2_back_stitched.png
   pcbstitch --name shin_back back2.ARW back3.ARW back1.ARW
+  pcbstitch front1.ARW front2.ARW front3.ARW --detail IC.ARW   # extra shot to read chip markings
 """
 import argparse, glob, math, os, re, shutil, struct, subprocess, sys, tempfile, zlib
 from pathlib import Path
@@ -119,6 +123,19 @@ def p_line_crop(lines):
     p = next(l for l in lines if l.startswith("p "))
     m = re.search(r"\bS(\d+),(\d+),(\d+),(\d+)", p)
     return tuple(map(int, m.groups())) if m else None
+
+
+def set_disabled(lines, first):
+    """Copy of a project with images from index `first` on marked disabled (Hugin skips them for
+    autocrop and photometric optimisation) and all earlier ones enabled."""
+    out = [re.sub(r"\s+disabled\b", "", x) if x.startswith("#-hugin") else x for x in lines]
+    ilines = [i for i, x in enumerate(out) if x.startswith("i ")]
+    for i in reversed(ilines[first:]):
+        if out[i - 1].startswith("#-hugin"):
+            out[i - 1] += " disabled"
+        else:
+            out.insert(i, "#-hugin  disabled")
+    return out
 
 
 def hfov_from_exif(img, crop_factor, focal_override):
@@ -376,7 +393,56 @@ def seam_blend(layers, band, log):
     return np.dstack([rgb, alpha])
 
 
-def ghost_check(out, layers, crop_xy, qa_image=None):
+def detail_regions(base, det, s=0.5, grow=40, min_area=6000):
+    """Where a detail frame shows clearly more fine detail than the stitch (e.g. chip markings that
+    only show under its lighting) while agreeing with it at a coarse scale (so objects that moved
+    between shots are never pasted). Each region is grown to its convex hull plus `grow` px.
+    Returns a feathered full-resolution mask (0..1) and the patched area in pixels."""
+    maxv = 65535 if base.dtype == np.uint16 else 255
+    h, w = base.shape[:2]
+    sw, sh = int(w * s), int(h * s)
+    sm = lambda x: cv2.resize(x, (sw, sh), interpolation=cv2.INTER_AREA)
+    b = sm(base[:, :, :3]).astype(np.float32) * (255.0 / maxv)
+    d = sm(det[:, :, :3]).astype(np.float32) * (255.0 / maxv)
+    ok = sm(((det[:, :, 3] > 0) & (base[:, :, 3] > 0)).astype(np.uint8)) > 0
+    ok = cv2.erode(ok.astype(np.uint8), np.ones((15, 15))) > 0
+
+    def energy(x):          # local fine-detail strength
+        g = cv2.cvtColor(x, cv2.COLOR_BGR2GRAY)
+        return cv2.GaussianBlur(np.abs(g - cv2.GaussianBlur(g, (0, 0), 1.5)), (0, 0), 6)
+
+    low = np.abs(cv2.GaussianBlur(b, (0, 0), 12) - cv2.GaussianBlur(d, (0, 0), 12)).max(2)
+    # compare fine detail at matched local brightness, so a brighter (noisier) frame can't win on noise
+    gain = (cv2.GaussianBlur(b, (0, 0), 12) + 4) / (cv2.GaussianBlur(d, (0, 0), 12) + 4)
+    eb, ed = energy(b), energy(np.clip(d * gain, 0, 255))
+    disagree = cv2.dilate((low > 25).astype(np.uint8), np.ones((9, 9))) > 0
+    cand = (ed > 1.8 * eb + 1.5) & ~disagree & ok
+    m = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5)))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((25, 25)))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m)
+    region = np.zeros((sh, sw), np.uint8)
+    for i in range(1, n):
+        if st[i][4] / (s * s) >= min_area:
+            cv2.fillConvexPoly(region, cv2.convexHull(cv2.findNonZero((lab == i).astype(np.uint8))), 1)
+    region = cv2.dilate(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(grow * s) + 1,) * 2))
+    region &= (~disagree & ok).astype(np.uint8)
+    full = cv2.resize(region.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    return cv2.GaussianBlur(full, (0, 0), 8), int(region.sum() / (s * s))
+
+
+def apply_detail(base, det, mask, sigma=25):
+    """Blend the detail frame in through mask, keeping its fine detail but the stitch's coarse tone,
+    so the different lighting of the detail shot does not show as a patch."""
+    maxv = 65535 if base.dtype == np.uint16 else 255
+    b = base[:, :, :3].astype(np.float32)
+    d = det[:, :, :3].astype(np.float32)
+    d += cv2.GaussianBlur(b, (0, 0), sigma) - cv2.GaussianBlur(d, (0, 0), sigma)
+    out = base.copy()
+    out[:, :, :3] = np.clip(b + (d - b) * mask[:, :, None] + 0.5, 0, maxv).astype(base.dtype)
+    return out
+
+
+def ghost_check(out, layers, crop_xy, qa_image=None, outline=None):
     """Pixels of the result that match none of the source layers covering them."""
     x0, y0 = crop_xy
     h, w = out.shape[:2]
@@ -389,12 +455,18 @@ def ghost_check(out, layers, crop_xy, qa_image=None):
         d = cv2.blur(np.abs(L[:, :, :3].astype(np.float32) * scale - O).max(2), (5, 5))
         best = np.where(m, np.minimum(best, d), best)
     bad = cv2.morphologyEx((best > 40).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5)))
+    if outline is not None:         # detail-frame patches differ from the strip on purpose
+        bad[outline > 0.05] = 0
     n, _, st, _ = cv2.connectedComponentsWithStats(bad)
     blobs = [st[i] for i in range(1, n) if st[i][4] > 400]
     if qa_image:
         vis = cv2.resize((O).astype(np.uint8), None, fx=0.2, fy=0.2, interpolation=cv2.INTER_AREA)
         r = cv2.dilate(cv2.resize(bad * 255, (vis.shape[1], vis.shape[0])), np.ones((7, 7)))
         vis[r > 0] = (0, 0, 255)
+        if outline is not None:     # detail-frame patches in cyan
+            o = cv2.resize((outline > 0.5).astype(np.uint8), (vis.shape[1], vis.shape[0]))
+            cnts, _ = cv2.findContours(o, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(vis, cnts, -1, (255, 255, 0), 2)
         cv2.imwrite(str(qa_image), vis)
     return int(bad.sum()), len(blobs)
 
@@ -457,6 +529,9 @@ def main():
     ap.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
                     help="coarse rotation when developing raws")
     ap.add_argument("--redevelop", action="store_true", help="re-develop raws even if PNGs exist")
+    ap.add_argument("--detail", type=Path, nargs="+", action="extend", default=[], metavar="IMAGE",
+                    help="extra close-up/re-lit photo(s) used only where they show more detail "
+                         "(e.g. chip markings); aligned with the others but not used for the rest")
     ap.add_argument("--keep-redundant", action="store_true",
                     help="use every image, even ones fully covered by the others (default: skip them)")
     ap.add_argument("--qa-image", action="store_true", help="also write <name>_qa.jpg marking ghost pixels")
@@ -469,10 +544,18 @@ def main():
             die(f"no such file: {p}")
     if len(images) < 2:
         die("need at least two images")
+    details = [p.expanduser().resolve() for p in a.detail]
+    for p in details:
+        if not p.is_file():
+            die(f"no such file: {p}")
+        if p in images:
+            die(f"{p.name} is given both as a strip image and as --detail")
     raws = [p for p in images if p.suffix.lower() in RAW_EXT]
     if raws and len(raws) != len(images):
         die("mix of raw and non-raw input; pass one kind")
-    tools = HUGIN_TOOLS + (["rawtherapee-cli"] if raws else []) + (["enblend"] if a.blend != "seams" else [])
+    raw_details = [p for p in details if p.suffix.lower() in RAW_EXT]
+    tools = HUGIN_TOOLS + (["rawtherapee-cli"] if raws or raw_details else []) + \
+        (["enblend"] if a.blend != "seams" else [])
     missing = [t for t in tools if not shutil.which(t)]
     if missing:
         die("missing tools: " + ", ".join(missing))
@@ -481,6 +564,10 @@ def main():
     if raws:
         images = develop_raws(raws, (a.png_dir or raws[0].parent / "png").expanduser().resolve(),
                               a.rotate, a.redevelop)
+    if raw_details:
+        developed = develop_raws(raw_details, (a.png_dir or raw_details[0].parent / "png").expanduser().resolve(),
+                                 a.rotate, a.redevelop)
+        details = [developed[raw_details.index(p)] if p in raw_details else p for p in details]
     outdir = (a.outdir or default_outdir(images)).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     base = f"{name}_stitched"
@@ -489,16 +576,20 @@ def main():
     anchor = a.anchor if a.anchor is not None else (len(images) - 1) // 2
     if not 0 <= anchor < len(images):
         die("--anchor out of range")
-    ordered = [images[anchor]] + [p for i, p in enumerate(images) if i != anchor]   # anchor is image 0
+    # anchor is image 0; detail frames go last and are aligned but not blended
+    ordered = [images[anchor]] + [p for i, p in enumerate(images) if i != anchor]
+    n_main = len(ordered)
+    ordered += details
     n = len(ordered)
 
     work = Path(tempfile.mkdtemp(prefix="pcbstitch-"))
     log = open(out_log, "w")
     run = Runner(work, log)
-    print(f"{base}: {n} images, anchor {ordered[0].name} -> {out_png}")
+    extra = f" + {len(details)} detail" if details else ""
+    print(f"{base}: {n_main} images{extra}, anchor {ordered[0].name} -> {out_png}")
     try:
         fov = a.fov or hfov_from_exif(ordered[0], a.crop_factor, a.focal)
-        times = [capture_time(p) for p in ordered]
+        times = [capture_time(p) for p in ordered[:n_main]]
         known = [t for t in times if t]
         if known and (max(known) - min(known)).total_seconds() > 3600:
             print("  warning: these photos were taken at different times; loose parts may have moved:")
@@ -525,27 +616,58 @@ def main():
                 run("autooptimiser", "-n", "-o", "f.pto", "f2.pto")
 
         align(ordered)
-        if n > 2 and not a.keep_redundant:
-            dropped, gap = find_redundant(footprints(run, "f.pto"), ordered, times, log)
+        if n_main > 2 and not a.keep_redundant:
+            masks = footprints(run, "f.pto")[:n_main]      # detail frames neither count nor get dropped
+            dropped, gap = find_redundant(masks, ordered[:n_main], times, log)
             if dropped:
                 for i in dropped:
                     why = f", taken {gap[i] / 3600:.1f} h apart from the others" if gap[i] > 3600 else ""
                     print(f"  skipping {ordered[i].name}: its whole area is covered by the other photos{why}"
-                          " (use --keep-redundant to keep it)")
+                          " (use --keep-redundant to keep it, or --detail to use it for detail only)")
                 ordered = [p for i, p in enumerate(ordered) if i not in dropped]
+                n_main -= len(dropped)
                 n = len(ordered)
                 align(ordered)
 
         step("photometric optimisation")
-        pho = ["Vb0", "Vc0", "Vd0", "Ra0", "Rb0", "Rc0", "Rd0", "Re0"] + [f"Eev{i}" for i in range(1, n)]
+        # strip images only: detail frames are lit differently and would shift the tone of everything
+        pho = ["Vb0", "Vc0", "Vd0", "Ra0", "Rb0", "Rc0", "Rd0", "Re0"] + [f"Eev{i}" for i in range(1, n_main)]
         run("pto_var", "--opt", ",".join(pho), "-o", "g.pto", "f.pto")
+        write_pto(work / "g.pto", set_disabled(read_pto(work / "g.pto"), n_main))
         if run("vig_optimize", "-o", "h.pto", "g.pto", check=False).returncode != 0:
             print("  warning: photometric optimisation failed; continuing without it")
             shutil.copy(work / "g.pto", work / "h.pto")
+        write_pto(work / "h.pto", set_disabled(read_pto(work / "h.pto"), n))
+        if n > n_main:
+            # pto_gen set the output exposure to the mean EXIF exposure of *all* images, so a detail
+            # frame shot at another shutter speed would darken or brighten the whole result. Use the
+            # strip's mean, and render detail frames at that exposure too: the developed PNGs already
+            # have matched brightness, and patches are tone-matched to the stitch anyway.
+            eev = [float(re.search(r" Eev([-\d.e]+)", x).group(1))
+                   for x in read_pto(work / "a.pto") if x.startswith("i ")][:n_main]
+            e = f"{sum(eev) / len(eev):.6f}"
+            hl, k = [], 0
+            for x in read_pto(work / "h.pto"):
+                if x.startswith("p "):
+                    x = re.sub(r" E[-\d.e]+", f" E{e}", x, count=1)
+                elif x.startswith("i "):
+                    if k >= n_main:
+                        x = re.sub(r" Eev[-\d.e]+", f" Eev{e}", x, count=1)
+                    k += 1
+                hl.append(x)
+            write_pto(work / "h.pto", hl)
         run("pano_modify", "--projection=0", "--fov=AUTO", "--canvas=AUTO", "--crop=AUTO",
             "--output-type=NORMAL", "--ldr-file=PNG", "-o", "final.pto", "h.pto")
 
         final = read_pto(work / "final.pto")
+        if n > n_main:
+            # autocrop over the strip only: detail frames are marked disabled for this
+            write_pto(work / "crop_in.pto", set_disabled(final, n_main))
+            run("pano_modify", "--crop=AUTO", "-o", "crop_out.pto", "crop_in.pto")
+            s = p_line_crop(read_pto(work / "crop_out.pto"))
+            if s:
+                final = [re.sub(r" S\d+,\d+,\d+,\d+", " S%d,%d,%d,%d" % s, x) if x.startswith("p ") else x
+                         for x in final]
         crop = p_line_crop(final)
         # full-canvas copy for rendering separate layers
         full = [re.sub(r" S\d+,\d+,\d+,\d+", "", l).replace(" r:CROP", "") if l.startswith("p ") else l
@@ -556,6 +678,7 @@ def main():
         run("nona", "-m", "TIFF_m", "-o", "layer", "full.pto")
         files = sorted(glob.glob(str(work / "layer*.tif")))
         layers = load_layers(files)
+        files, detail_layers, layers = files[:n_main], layers[n_main:], layers[:n_main]
 
         mode = a.blend
         axis = strip_axis([l[:, :, 3] > 0 for l in layers])
@@ -576,6 +699,18 @@ def main():
             run("enblend", "-o", "blend.tif", *files)
             res = cv2.imread(str(work / "blend.tif"), cv2.IMREAD_UNCHANGED)
             margin = 2      # nona leaves partially covered pixels on the layer boundaries
+
+        patched = None
+        for p, dl in zip(ordered[n_main:], detail_layers):
+            step(f"detail from {p.name}")
+            mask, area = detail_regions(res, dl)
+            if area == 0:
+                print(f"  {p.name}: no area with more detail than the stitch; not used")
+                continue
+            res = apply_detail(res, dl, mask)
+            patched = mask if patched is None else np.maximum(patched, mask)
+            print(f"  {p.name}: used in {cv2.connectedComponents((mask > 0.5).astype(np.uint8))[0] - 1} "
+                  f"region(s), {area / 1e6:.2f} MP")
         if crop:
             l, r, t, b = crop
             l, r, t, b = l + margin, r - margin, t + margin, b - margin
@@ -588,15 +723,18 @@ def main():
         cv2.imwrite(str(out_png), out, [cv2.IMWRITE_PNG_COMPRESSION, 6])
         add_png_metadata(out_png, ordered[0])
 
-        # project file next to the result, image paths relative like Hugin writes them
+        # project file next to the result, image paths relative like Hugin writes them;
+        # detail frames are included but disabled, as they are only used for patches
         rel = [re.sub(r'n"([^"]+)"', lambda m: f'n"{os.path.relpath(m.group(1), outdir)}"', x)
-               if x.startswith("i ") else x for x in final]
+               if x.startswith("i ") else x for x in set_disabled(final, n_main)]
         write_pto(out_pto, rel)
 
         cp = run("checkpto", out_pto).stdout
         mean = re.search(r"Mean error\s*:\s*([\d.]+)", cp); mx = re.search(r"Maximum\s*:\s*([\d.]+)", cp)
         npts = re.search(r"(\d+) control points", cp)
-        ghosts, blobs = ghost_check(out, layers, (l, t), outdir / f"{name}_qa.jpg" if a.qa_image else None)
+        pmask = patched[t:b, l:r] if patched is not None else None
+        ghosts, blobs = ghost_check(out, layers, (l, t), outdir / f"{name}_qa.jpg" if a.qa_image else None,
+                                    outline=pmask)
         print(f"done: {out_png.name} {out.shape[1]}x{out.shape[0]}")
         print(f"  control points {npts.group(1) if npts else '?'}, mean error {mean.group(1) if mean else '?'}px, "
               f"max {mx.group(1) if mx else '?'}px")
