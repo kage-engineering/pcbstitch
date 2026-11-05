@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Prefix photo file names with the folders they live in.
+
+    box/ARW/front.ARW                      -> box/ARW/box_front.ARW
+    device/ARW/front.ARW                   -> exterior/ARW/exterior_front.ARW
+    PCB/PCB1/back/png/back.png             -> PCB/PCB1/back/png/PCB_PCB1_back.png
+    PCB/front/with_rf/png/1.png           -> PCB/front/with_rf/png/PCB_front_with-rf_1.png
+    PCB/front/with_rf/stitched/front.png   -> PCB/front/with_rf/stitched/PCB_front_with-rf_stitched.png
+
+Folders named after a file format (ARW, png, ...) are left out of the name,
+underscores inside folder names become hyphens, and files stay where they are,
+except that a top-level "device" folder is itself renamed to "exterior".
+Sidecars (.pp3, .xmp) follow their image. Hugin .pto projects in a "stitched"
+folder are renamed too, and their image paths are pointed at ../png/.
+Files that already carry their prefix are skipped, so it is safe to re-run.
+
+Dry run by default; pass --run to rename.
+"""
+import argparse
+import os
+import re
+import sys
+
+IMAGE_EXTS = [".ARW", ".DNG", ".CR2", ".CR3", ".NEF", ".RAF", ".ORF",
+              ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp", ".heic"]
+SIDECAR_EXTS = [".pp3", ".xmp"]
+FORMAT_DIRS = {"arw", "dng", "cr2", "cr3", "nef", "raf", "orf",
+               "png", "jpg", "jpeg", "tif", "tiff", "webp", "heic", "raw"}
+# Top-level folders to rename, along with the prefix of the files inside them.
+TOP_LEVEL_ALIASES = {"device": "exterior"}
+
+
+def split_ext(name):
+    """Return (stem, ext), keeping sidecar double extensions like .ARW.pp3 together."""
+    lower = name.lower()
+    for side in SIDECAR_EXTS:
+        if lower.endswith(side):
+            for img in IMAGE_EXTS:
+                if lower.endswith((img + side).lower()):
+                    n = len(img) + len(side)
+                    return name[:-n], name[-n:]
+    for ext in IMAGE_EXTS + [".pto"]:
+        if lower.endswith(ext.lower()):
+            return name[:-len(ext)], name[-len(ext):]
+    return None, None
+
+
+def build_plan(root, exclude):
+    plan = []
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames.sort()
+        rel = os.path.relpath(dirpath, root)
+        if rel == ".":
+            dirnames[:] = [d for d in dirnames if d not in exclude]
+            continue
+        parts = [p.replace("_", "-") for p in rel.split(os.sep)
+                 if p.lower() not in FORMAT_DIRS]
+        folder_prefix = "_".join(parts)
+        parts[0] = TOP_LEVEL_ALIASES.get(parts[0], parts[0])
+        prefix = "_".join(parts)
+        stitched = parts[-1] == "stitched"
+        for f in sorted(files):
+            stem, ext = split_ext(f)
+            if ext is None:
+                continue
+            if stitched:
+                new = prefix + ext
+            elif stem in (parts[-1], f"{prefix}_{parts[-1]}"):
+                # The photo is named after its folder: don't repeat it.
+                new = prefix + ext
+            elif stem == prefix or stem.startswith(prefix + "_"):
+                continue
+            else:
+                # Swap the folder prefix of files renamed before the alias existed.
+                if stem.startswith(folder_prefix + "_"):
+                    stem = stem[len(folder_prefix) + 1:]
+                new = f"{prefix}_{stem}{ext}"
+            if new != f:
+                plan.append((os.path.join(dirpath, f), os.path.join(dirpath, new)))
+    return plan
+
+
+def build_dir_plan(root, exclude):
+    return [(os.path.join(root, old), os.path.join(root, new))
+            for old, new in TOP_LEVEL_ALIASES.items()
+            if old not in exclude and os.path.isdir(os.path.join(root, old))]
+
+
+def fix_pto(path, new_name):
+    """Point a Hugin project's images at ../png/<prefix>_<n>.png."""
+    prefix = new_name[:-len("_stitched.pto")]
+    with open(path) as fh:
+        txt = fh.read()
+
+    def repl(m):
+        base = os.path.basename(m.group(1))
+        if not base.startswith(prefix + "_"):
+            base = f"{prefix}_{base}"
+        return f'n"../png/{base}"'
+
+    img = "|".join(re.escape(e) for e in IMAGE_EXTS)
+    txt = re.sub(rf'n"([^"]*(?:{img}))"', repl, txt, flags=re.IGNORECASE)
+    with open(path, "w") as fh:
+        fh.write(txt)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("root", help="top folder of the photo set")
+    ap.add_argument("--run", action="store_true", help="actually rename (default: dry run)")
+    ap.add_argument("--exclude", nargs="*", default=["manual", "3D"],
+                    help="top-level folders to leave alone (default: manual 3D)")
+    args = ap.parse_args()
+
+    root = os.path.abspath(os.path.expanduser(args.root))
+    plan = build_plan(root, set(args.exclude))
+    dir_plan = build_dir_plan(root, set(args.exclude))
+
+    news = [n for _, n in plan]
+    clashes = {n for n in news if news.count(n) > 1} | {n for n in news if os.path.exists(n)}
+    clashes |= {n for _, n in dir_plan if os.path.exists(n)}
+    if clashes:
+        for n in sorted(clashes):
+            print(f"clash: {os.path.relpath(n, root)}", file=sys.stderr)
+        sys.exit(1)
+
+    for old, new in plan:
+        print(f"{os.path.relpath(old, root):50} -> {os.path.basename(new)}")
+        if args.run:
+            if old.endswith(".pto"):
+                fix_pto(old, os.path.basename(new))
+            os.rename(old, new)
+
+    for old, new in dir_plan:
+        print(f"{os.path.relpath(old, root) + '/':50} -> {os.path.basename(new)}/")
+        if args.run:
+            os.rename(old, new)
+
+    summary = f"{len(plan)} files and {len(dir_plan)} folders"
+    if not plan and not dir_plan:
+        print("nothing to rename")
+    elif args.run:
+        print(f"{summary} renamed")
+    else:
+        print(f"{summary} would be renamed (dry run, pass --run to apply)")
+
+
+if __name__ == "__main__":
+    main()
