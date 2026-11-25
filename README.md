@@ -162,7 +162,7 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
    - The HFOV is **not** optimised.
    - Then up to three rounds of: compute each point's residual in source-image pixels, drop points above max(3 px, 3× median), re-optimise.
    - **Session check:** if the photos' EXIF capture times span more than an hour, it warns and lists them, because loose parts may have moved in between.
-   - **Redundant frames:** with three or more images, each image's outline is projected onto the panorama. An image whose area is at least 97% covered by the others is skipped and reported, and steps 2–4 run again without it. It never drops the anchor; it prefers to drop a frame taken furthest in time from the others, then the least sharp one. `--keep-redundant` turns this off.
+   - **Redundant frames:** with three or more images, each image's outline is projected onto the panorama. An image whose area is at least 97% covered by the others is skipped and reported, and steps 2–4 run again without it. It never drops the anchor, and never a frame the others need to stay linked by control points (at least 6 points per pair). It prefers to drop a frame taken furthest in time from the others, then the least sharp one. If the others still can't all be linked after a drop, it keeps every frame. `--keep-redundant` turns this off.
 5. **Optimise photometrics** (`vig_optimize`): exposure of each non-anchor image and the camera response curve (`Ra…Re`). Vignetting (`Vb Vc Vd`) is only fitted with `--vignetting`, because the lens profile in RawTherapee already corrects it ([why](#photometrics)). The anchor frame keeps its developed colours exactly. Detail frames are aligned in steps 2–4 like the others, but are marked `disabled` for this step. They're then given the strip's exposure, and the output exposure `E` is set to the strip's mean.
 6. **Set up output** (`pano_modify`): rectilinear projection, automatic FOV and canvas, autocrop.
 7. **Render** each image as its own full-canvas layer (`nona -m TIFF_m`).
@@ -331,6 +331,18 @@ What fixed it:
   fallback to the nearest layer that covers it. With `--keep-redundant`, the same four frames now
   give 1,023 pixels in 1 region, and the shin back set (with the moved cable) went from 1,966
   ghost pixels in 2 regions to 0.
+
+**Covered is not the same as unneeded.** A later four-shot strip (4 at the top, then 3, 2, 1)
+had a third frame that was 99.8% covered by its neighbours 2 and 4, so it was skipped. But cpfind
+had matched only 1–2, 2–3 and 3–4, never 2 with 4 directly, so the skipped frame was the only link
+to the top one. Re-aligned without it, the top frame could not be placed, and the output was
+missing the top of the board, with 47–63-level disagreements in the overlaps. A second bug let this
+through: the "all images connected" check only counted images that had *some* control points. Now:
+- a frame is only skipped if the remaining frames stay linked;
+- every image counts in the connectivity check;
+- if a re-alignment after skipping still can't link everything, all frames are kept.
+
+The same four frames now stitch at 0.64 px mean error with no ghost regions.
 
 ### Detail frames: reading chip markings
 

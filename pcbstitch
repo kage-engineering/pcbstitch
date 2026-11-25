@@ -153,10 +153,33 @@ def hfov_from_exif(img, crop_factor, focal_override):
 
 # ----------------------------------------------------------------------------- control points
 
+def connected(nodes, pairs):
+    """Whether control-point pairs link every image in `nodes` into one group."""
+    nodes = set(nodes)
+    if len(nodes) <= 1:
+        return True
+    seen, grow = {min(nodes)}, True
+    while grow:
+        grow = False
+        for a, b in pairs:
+            if a in nodes and b in nodes and (a in seen) != (b in seen):
+                seen |= {a, b}; grow = True
+    return seen == nodes
+
+
+def cp_links(lines, min_points=6):
+    """Image pairs joined by at least `min_points` control points."""
+    count = {}
+    for _, (n, N, *_) in cp_lines(lines):
+        count[(n, N)] = count.get((n, N), 0) + 1
+    return {p for p, c in count.items() if c >= min_points}
+
+
 def ransac_filter(src, dst, thresh, log):
     """Per image pair keep only points consistent with one planar homography,
     then drop weak pairs (<20% of the strongest) if the images stay connected without them."""
     lines = read_pto(src)
+    nodes = set(range(sum(1 for x in lines if x.startswith("i "))))
     pairs = {}
     for i, (n, N, x, y, X, Y) in cp_lines(lines):
         pairs.setdefault((n, N), []).append((i, (x, y, X, Y)))
@@ -172,28 +195,20 @@ def ransac_filter(src, dst, thresh, log):
         drop |= {v[k][0] for k in np.where(m.ravel() == 0)[0]}
         log.write(f"pair {p}: kept {int(m.sum())}/{len(v)} planar-consistent points\n")
     count = {p: sum(1 for i, _ in v if i not in drop) for p, v in pairs.items()}
-    nodes = {x for p in count for x in p}
-
-    def connected(ps):
-        seen, grow = {min(nodes)}, True
-        while grow:
-            grow = False
-            for a, b in ps:
-                if (a in seen) != (b in seen):
-                    seen |= {a, b}; grow = True
-        return seen == nodes
-
+    if not count:
+        write_pto(dst, lines)
+        return 0, False
     keep = set(count)
     strongest = max(count.values())
     for p in sorted(count, key=count.get):
-        if count[p] < 0.2 * strongest and connected(keep - {p}):
+        if count[p] < 0.2 * strongest and connected(nodes, keep - {p}):
             keep.discard(p)
             log.write(f"dropping weak pair {p} ({count[p]} points)\n")
     for p, v in pairs.items():
         if p not in keep:
             drop |= {i for i, _ in v}
     write_pto(dst, [l for i, l in enumerate(lines) if i not in drop])
-    return len(cp_lines(lines)) - len(drop), connected(keep)
+    return len(cp_lines(lines)) - len(drop), connected(nodes, keep)
 
 
 def trafo(run, pto, img, pts, reverse=False):
@@ -273,10 +288,12 @@ def footprints(run, pto):
     return masks
 
 
-def find_redundant(masks, images, times, log, threshold=0.97):
+def find_redundant(masks, images, times, log, links, n_all, threshold=0.97):
     """Frames whose whole area is covered by the other frames add nothing but extra seams (and,
-    if shot at another time, things that moved). Greedily drop them, never the anchor (index 0):
-    prefer the frame shot furthest from the others, then the least sharp."""
+    if shot at another time, things that moved). Greedily drop them, never the anchor (index 0)
+    and never a frame the others need to stay linked by control points (`links`, over all `n_all`
+    images including detail frames): prefer the frame shot furthest from the others, then the
+    least sharp."""
     known = [t for t in times if t]
     median = sorted(known)[len(known) // 2] if known else None
     gap = [abs((t - median).total_seconds()) if t and median else 0 for t in times]
@@ -290,8 +307,12 @@ def find_redundant(masks, images, times, log, threshold=0.97):
             others = np.any([masks[j] for j in alive if j != i], axis=0)
             frac = (masks[i] & others).sum() / max(int(masks[i].sum()), 1)
             log.write(f"redundancy: {images[i].name} {frac:.1%} covered by the others\n")
-            if frac >= threshold:
-                cands.append(i)
+            if frac < threshold:
+                continue
+            if not connected(set(range(n_all)) - set(dropped) - {i}, links):
+                log.write(f"redundancy: keeping {images[i].name}, the others would no longer be linked\n")
+                continue
+            cands.append(i)
         if not cands:
             break
         for i in cands:
@@ -609,7 +630,7 @@ def main():
             run("cpclean", "-o", "c.pto", "b.pto")
             kept, ok = ransac_filter(work / "c.pto", work / "d.pto", a.ransac_px, log)
             if not ok or kept == 0:
-                die("images could not all be connected by control points; check overlap/order")
+                return False
             step("geometric optimisation")
             geo = ["b0"] + [f"{v}{i}" for i in range(1, n) for v in ("r", "p", "y", "TrX", "TrY", "TrZ")]
             run("pto_var", "--opt", ",".join(geo), "-o", "e.pto", "d.pto")
@@ -618,20 +639,26 @@ def main():
                 if prune(run, "f.pto", "f2.pto", log) == 0:
                     break
                 run("autooptimiser", "-n", "-o", "f.pto", "f2.pto")
+            return True
 
-        align(ordered)
+        if not align(ordered):
+            die("images could not all be connected by control points; check overlap/order")
         if n_main > 2 and not a.keep_redundant:
             masks = footprints(run, "f.pto")[:n_main]      # detail frames neither count nor get dropped
-            dropped, gap = find_redundant(masks, ordered[:n_main], times, log)
+            dropped, gap = find_redundant(masks, ordered[:n_main], times, log,
+                                          cp_links(read_pto(work / "f.pto")), n)
             if dropped:
                 for i in dropped:
                     why = f", taken {gap[i] / 3600:.1f} h apart from the others" if gap[i] > 3600 else ""
                     print(f"  skipping {ordered[i].name}: its whole area is covered by the other photos{why}"
                           " (use --keep-redundant to keep it, or --detail to use it for detail only)")
-                ordered = [p for i, p in enumerate(ordered) if i not in dropped]
-                n_main -= len(dropped)
-                n = len(ordered)
-                align(ordered)
+                fewer = [p for i, p in enumerate(ordered) if i not in dropped]
+                if align(fewer):
+                    ordered, n_main, n = fewer, n_main - len(dropped), len(fewer)
+                else:
+                    print("  ...but without them the other photos could not all be linked; keeping every photo")
+                    if not align(ordered):
+                        die("images could not all be connected by control points; check overlap/order")
 
         step("photometric optimisation")
         # strip images only: detail frames are lit differently and would shift the tone of everything
