@@ -180,7 +180,7 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
    Detail frames are left out of both.
 9. **Patch in detail frames** (`--detail`):
    - **Same scale** (re-lit or refocused): paste it into the regions where it shows clearly more fine detail than the stitch while agreeing with it at a coarse scale. The patch keeps the frame's fine detail but takes the stitch's coarse tone.
-   - **Close-up** (more than 1.25× the strip's magnification): use it over its whole overlap, except sizeable areas whose structure doesn't match (tall or moved parts). Its colours are mapped to the stitch's with a per-channel tone curve and a smooth brightness gain.
+   - **Close-up** (more than 1.25× the strip's magnification): use it over its whole overlap, except sizeable areas whose structure doesn't match (tall or moved parts). Its colours are mapped to the stitch's with a per-channel tone curve and a smooth brightness gain. In the mid-scale detail, whichever of the close-up and the stitch shows more contrast wins (Laplacian-pyramid fusion), so features the strip's light shows better, such as traces, aren't lost.
 10. **Write output**:
    - Crop to Hugin's autocrop rectangle, computed over the strip only and shrunk by a few pixels (see below).
    - Write the PNG and insert the `iCCP` and `eXIf` chunks from the anchor image.
@@ -426,6 +426,15 @@ the light from the other side. Each of these broke something:
   white background pink. A per-channel tone curve works: for each close-up level, the median
   stitch level at the same places, made monotonic with the slope capped at 1.5 so dark noise
   isn't boosted. A smooth brightness gain (σ = 100 px) is applied on top.
+- **Lighting shows different things.** Traces under the solder mask stood out in the strip
+  photos but were faint in the close-up, whose light came from the other side. So the
+  close-up's result had sharper text but faded traces. The two are now fused band by band, as
+  in focus stacking:
+  - The finest two pyramid levels and the base tone stay the close-up's. That's where its
+    resolution is. Mixing there blurred chip text, because a chip's top sits a few pixels apart
+    in the two photos.
+  - In the four coarser levels, each place takes a soft choice weighted by local contrast²,
+    so the strip's stronger trace edges come through.
 
 ### Edges and cropping
 

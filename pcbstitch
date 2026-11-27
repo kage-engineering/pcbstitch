@@ -578,9 +578,38 @@ def ok_full(det, base):
     return ((det[:, :, 3] > 0) & (base[:, :, 3] > 0)).astype(np.float32)
 
 
+def fuse_contrast(b, d, levels=6, keep_fine=2):
+    """Laplacian-pyramid fusion of the stitch `b` into a close-up `d` (same tone already).
+    The finest `keep_fine` scales and the overall tone stay the close-up's: that is where its
+    extra resolution is, and mixing there would blur parts that sit a few pixels apart in the two
+    photos (the top of a chip). In the coarser scales, at every place, whichever shows more
+    contrast wins, as in focus stacking: there the strip's light can show what the close-up's
+    barely picks out, such as traces under the solder mask."""
+    def pyr(x):
+        g = [x]
+        for _ in range(levels - 1):
+            g.append(cv2.pyrDown(g[-1]))
+        lap = [g[k] - cv2.pyrUp(g[k + 1], dstsize=(g[k].shape[1], g[k].shape[0]))
+               for k in range(levels - 1)]
+        return lap, g[-1]
+    lb, _ = pyr(b)
+    ld, out = pyr(d)
+    for k in reversed(range(levels - 1)):
+        up = cv2.pyrUp(out, dstsize=(ld[k].shape[1], ld[k].shape[0]))
+        if k < keep_fine:
+            out = up + ld[k]
+            continue
+        ab = cv2.GaussianBlur(np.abs(lb[k]).sum(2), (0, 0), 2)     # local contrast at this scale
+        ad = cv2.GaussianBlur(np.abs(ld[k]).sum(2), (0, 0), 2)
+        w = (ad * ad / (ab * ab + ad * ad + 1e-6))[:, :, None]     # soft choice, no hard switching
+        out = up + w * ld[k] + (1 - w) * lb[k]
+    return out
+
+
 def apply_closeup(base, det, mask, sigma=100):
-    """Blend a close-up in through mask with only a smooth per-channel gain, so its fine detail
-    and local contrast stay intact (an additive local match puts coloured halos on white print)."""
+    """Blend a close-up in through mask: its colours are mapped to the stitch's (tone curves and a
+    smooth gain, so its fine detail stays intact; an additive local match puts coloured halos on
+    white print), and mid-scale contrast the strip shows better is fused in (fuse_contrast)."""
     maxv = 65535 if base.dtype == np.uint16 else 255
     h, w = base.shape[:2]
     sel = mask > 0.01
@@ -626,7 +655,8 @@ def apply_closeup(base, det, mask, sigma=100):
     gain = gain[:, :, None]
     out = base.copy()
     mk = mask[y0:y1, x0:x1, None]
-    out[y0:y1, x0:x1, :3] = np.clip(b + (d * gain - b) * mk + 0.5, 0, maxv).astype(base.dtype)
+    d = fuse_contrast(b, d * gain)
+    out[y0:y1, x0:x1, :3] = np.clip(b + (d - b) * mk + 0.5, 0, maxv).astype(base.dtype)
     return out
 
 
