@@ -62,9 +62,11 @@ To remove: `./install.sh --uninstall`.
   good photo of each position.
 - **Shoot one side in one session.** If loose parts are moved between photos (for example,
   photos taken on different days), parts of them can show up twice or cut off.
-- **Check the chip markings.** If you can't read the text on a chip, take one extra photo with
-  the light coming from a low angle across the chip until the text shows. Give it a clear name
-  (for example `IC.ARW`) and add it with `--detail` in step 3.
+- **Check the chip markings.** If you can't read the text on a chip, take one extra photo of it:
+  - **closer to the chip** (a close-up), which gives the sharpest text, or
+  - with the light coming from a low angle across the chip until the text shows.
+
+  Give it a clear name (for example `IC.ARW`) and add it with `--detail` in step 3.
 
 ## 3. Stitch
 
@@ -88,7 +90,11 @@ light at a low angle across the chip, and add it with `--detail`:
 pcbstitch front1.ARW front2.ARW front3.ARW --detail IC.ARW
 ```
 It is used **only** on the areas where it shows more detail, such as the chip tops. Everything
-else comes from the normal photos, so it's fine if it was taken at another time. The output says
+else comes from the normal photos, so it's fine if it was taken at another time.
+
+If it is a **close-up** (taken nearer), the whole result is made at the close-up's higher
+resolution, so the text is as sharp as possible. The image file gets bigger (about 3× the
+pixels for a close-up 1.7× nearer). Add `--strip-res` to keep the normal size. The output says
 how many areas it used (`IC.png: used in 6 region(s)`); `--qa-image` outlines them in light blue.
 
 The result goes into a `stitched/` folder:
@@ -127,6 +133,7 @@ Always look at the image yourself too, especially where the photos overlap.
 | `--qa-image` | save a picture showing problem areas |
 | `-o DIR` | put the result somewhere else |
 | `--detail IC.ARW` | use an extra photo only where it shows more detail, e.g. chip markings |
+| `--strip-res` | with a close-up `--detail` photo, keep the normal output size |
 
 `pcbstitch --help` lists everything.
 

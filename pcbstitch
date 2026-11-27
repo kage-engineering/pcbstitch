@@ -26,9 +26,13 @@ Pipeline
      images agree, every pixel is assigned to exactly one image, and the layers are feathered
      along the seams (avoids broken/ghosted cables and parts that moved); other layouts fall back
      to enblend. --blend chooses explicitly.
-  6. --detail frames (e.g. a shot lit to show chip markings) are aligned with the rest but only
-     pasted where they show clearly more fine detail than the stitch and agree with it at coarse
-     scale; patches keep their fine detail and take the stitch's tone.
+  6. --detail frames are matched with OpenCV SIFT (cpfind fails on a different scale, rotation
+     and lighting) and fitted to the already aligned strip with their own field of view.
+     A same-scale shot (e.g. re-lit to show chip markings) is only pasted where it shows clearly
+     more fine detail than the stitch and agrees with it at coarse scale. A close-up (shot nearer)
+     raises the resolution of the whole result to its own (--strip-res keeps the strip's) and is
+     used over its whole overlap, except tall or moved parts that don't line up; its colours are
+     mapped to the stitch with per-channel tone curves.
   7. output cropped to Hugin's autocrop, ICC profile + EXIF copied from the anchor image,
      and a QA line: control-point error and pixels that match none of the source images.
 
@@ -41,6 +45,7 @@ Examples
   pcbstitch PCB/PCB2/back/png/*.png                          # -> PCB/PCB2/back/stitched/PCB_PCB2_back_stitched.png
   pcbstitch --name shin_back back2.ARW back3.ARW back1.ARW
   pcbstitch front1.ARW front2.ARW front3.ARW --detail IC.ARW   # extra shot to read chip markings
+  pcbstitch 1.ARW 2.ARW 3.ARW 4.ARW --detail 5.ARW             # 5.ARW: close-up, output at its resolution
 """
 import argparse, glob, math, os, re, shutil, struct, subprocess, sys, tempfile, zlib
 from pathlib import Path
@@ -173,6 +178,59 @@ def cp_links(lines, min_points=6):
     for _, (n, N, *_) in cp_lines(lines):
         count[(n, N)] = count.get((n, N), 0) + 1
     return {p for p, c in count.items() if c >= min_points}
+
+
+def detail_points(images, n_main, lines, log, scale=0.5, per_pair=100, min_inliers=30):
+    """Control points for detail frames from OpenCV SIFT instead of cpfind.
+
+    A detail frame is often a close-up (a different scale) shot at another time under other light,
+    and cpfind finds only a handful of points for it. SIFT with a ratio test and a homography
+    RANSAC links it reliably; pairs with too few inliers or an implausible scale are ignored."""
+    sift = cv2.SIFT_create(nfeatures=30000)
+
+    def feats(p):
+        im = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        im = cv2.resize(im, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        return sift.detectAndCompute(im, None)
+
+    strip = [feats(p) for p in images[:n_main]]
+    out = [l for l in lines
+           if not (l.startswith("c ") and max(parse_cp(l)[:2]) >= n_main)]   # cpfind's detail points
+    matcher = cv2.BFMatcher()
+    rng = np.random.default_rng(0)
+    zooms = {}
+    for d in range(n_main, len(images)):
+        kd, dd = feats(images[d])
+        linked, best = 0, 0
+        for i, (k, des) in enumerate(strip):
+            if dd is None or des is None or len(k) < 8:
+                continue
+            good = [m[0] for m in matcher.knnMatch(dd, des, k=2)
+                    if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
+            if len(good) < min_inliers:
+                continue
+            src = np.float32([kd[m.queryIdx].pt for m in good])
+            dst = np.float32([k[m.trainIdx].pt for m in good])
+            H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3, maxIters=5000, confidence=0.999)
+            if H is None:
+                continue
+            inl = np.where(mask.ravel() == 1)[0]
+            zoom = math.sqrt(abs(np.linalg.det(H[:2, :2])))
+            log.write(f"detail {images[d].name} <> {images[i].name}: {len(inl)}/{len(good)} SIFT inliers, "
+                      f"scale {zoom:.3f}\n")
+            if len(inl) < min_inliers or not 0.05 < zoom < 5:
+                continue
+            if len(inl) > per_pair:
+                inl = rng.choice(inl, per_pair, replace=False)
+            for j in inl:
+                (x, y), (X, Y) = src[j] / scale, dst[j] / scale
+                out.append(f"c n{d} N{i} x{x:.3f} y{y:.3f} X{X:.3f} Y{Y:.3f} t0")
+            linked += 1
+            if len(inl) > best:
+                best, zooms[d] = len(inl), zoom
+        if not linked:
+            log.write(f"detail {images[d].name}: no strip image matched\n")
+    return out, zooms
 
 
 def ransac_filter(src, dst, thresh, log):
@@ -452,6 +510,126 @@ def detail_regions(base, det, s=0.5, grow=40, min_area=6000):
     return cv2.GaussianBlur(full, (0, 0), 8), int(region.sum() / (s * s))
 
 
+def closeup_regions(base, det, s=0.25, min_area=20000):
+    """Where a close-up (shot nearer than the strip, so with more real resolution) can replace the
+    stitch: it is sharper there and shows the same structure. Structure is compared by local
+    normalised correlation, which ignores the close-up's different lighting but rejects parts that
+    moved and tall parts (heatsinks, capacitor tops) that the nearer camera sees from another angle.
+    Returns a feathered full-resolution mask (0..1) and the patched area in pixels."""
+    h, w = base.shape[:2]
+    ok = (det[:, :, 3] > 0) & (base[:, :, 3] > 0)
+    ys, xs = np.where(ok)
+    if len(ys) == 0:
+        return np.zeros((h, w), np.float32), 0
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1   # work on the overlap only
+    B, D, ok = base[y0:y1, x0:x1], det[y0:y1, x0:x1], ok[y0:y1, x0:x1]
+    sz = (max(1, int((x1 - x0) * s)), max(1, int((y1 - y0) * s)))
+
+    def gray(x, blur):
+        g = cv2.cvtColor(np.ascontiguousarray(x[:, :, :3]), cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g = cv2.resize(g, sz, interpolation=cv2.INTER_AREA)
+        return cv2.GaussianBlur(g, (0, 0), blur) if blur else g
+
+    scale = 255.0 / (65535 if base.dtype == np.uint16 else 255)
+    b, d = gray(B, 1.5) * scale, gray(D, 1.5) * scale
+    G = lambda x, sig=8: cv2.GaussianBlur(x, (0, 0), sig)
+    mb, md = G(b), G(d)
+    vb, vd = np.maximum(G(b * b) - mb * mb, 0), np.maximum(G(d * d) - md * md, 0)
+    ncc = (G(b * d) - mb * md) / np.sqrt(np.maximum(vb * vd, 1e-3))
+    flat = (vb < 4) & (vd < 4)                     # nothing to compare there
+    okm = cv2.resize(ok.astype(np.uint8), sz, interpolation=cv2.INTER_NEAREST)
+    okm = cv2.erode(okm, np.ones((9, 9))) > 0
+    # The close-up is one photo, so inside a patch it is consistent with itself; only where the
+    # patch meets the stitch must the two agree. So exclude only sizeable disagreeing objects
+    # (tall parts seen from another angle, moved parts), with a margin, and keep the rest whole;
+    # small disagreements (the few-pixel parallax of a chip's top) stay inside the patch.
+    bad = ((ncc < 0.3) & ~flat).astype(np.uint8)
+    bad = cv2.morphologyEx(bad, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bad)
+    big = np.zeros_like(bad)
+    for i in range(1, n):
+        if st[i][4] >= 400 * s * s * 16:            # >= ~6400 px at full resolution
+            big[lab == i] = 1
+    big = cv2.dilate(big, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+    m = (okm & (big == 0)).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m)
+    keep = np.zeros_like(m)
+    for i in range(1, n):
+        if st[i][4] / (s * s) >= min_area:
+            keep[lab == i] = 1
+    # fill enclosed holes, so a patch never has a stitch island in it (the close-up agrees with
+    # itself, an island of another photo would not)
+    inv = (1 - keep).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(inv)
+    for i in range(1, n):
+        if not (st[i][0] == 0 or st[i][1] == 0 or
+                                                      st[i][0] + st[i][2] >= sz[0] or
+                                                      st[i][1] + st[i][3] >= sz[1]):
+            keep[lab == i] = 1
+    keep &= okm.astype(np.uint8)
+    full = np.zeros((h, w), np.float32)
+    full[y0:y1, x0:x1] = cv2.resize(keep.astype(np.float32), (x1 - x0, y1 - y0),
+                                    interpolation=cv2.INTER_LINEAR)
+    full = cv2.GaussianBlur(full, (0, 0), 10) * ok_full(det, base)
+    return full, int(keep.sum() / (s * s))
+
+
+def ok_full(det, base):
+    return ((det[:, :, 3] > 0) & (base[:, :, 3] > 0)).astype(np.float32)
+
+
+def apply_closeup(base, det, mask, sigma=100):
+    """Blend a close-up in through mask with only a smooth per-channel gain, so its fine detail
+    and local contrast stay intact (an additive local match puts coloured halos on white print)."""
+    maxv = 65535 if base.dtype == np.uint16 else 255
+    h, w = base.shape[:2]
+    sel = mask > 0.01
+    ys, xs = np.where(sel)
+    if len(ys) == 0:
+        return base
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    b = base[y0:y1, x0:x1, :3].astype(np.float32)
+    d = det[y0:y1, x0:x1, :3].astype(np.float32)
+    both = ((base[y0:y1, x0:x1, 3] > 0) & (det[y0:y1, x0:x1, 3] > 0)).astype(np.float32)
+    q = 0.125
+    small = lambda x: cv2.resize(x, None, fx=q, fy=q, interpolation=cv2.INTER_AREA)
+    wq = small(both)
+    G = lambda x: cv2.GaussianBlur(x, (0, 0), sigma * q)
+    # the close-up may be developed with another white balance and tone curve, so map it with a
+    # per-channel tone curve fitted where both overlap (for each level of the close-up, the median
+    # level of the stitch at the same places), then a smooth brightness gain for lighting/vignetting
+    sb, sd = small(b), small(d)
+    sel_q = wq > 0.5
+    bins = 64
+    d = d.copy()
+    for c in range(3):
+        x, y = sd[:, :, c][sel_q], sb[:, :, c][sel_q]
+        k = np.minimum((x / (maxv + 1) * bins).astype(int), bins - 1)
+        cx, cy = [], []
+        for i in range(bins):
+            sel_i = k == i
+            if sel_i.sum() >= 50:
+                cx.append(np.median(x[sel_i])); cy.append(np.median(y[sel_i]))
+        if len(cx) < 4:
+            continue
+        cy = np.maximum.accumulate(np.array(cy))                       # keep it monotonic
+        cx, cy = np.r_[0, cx, maxv], np.r_[0, cy, cy[-1] + (maxv - cx[-1])]
+        for i in range(1, len(cx)):                 # at most 1.5x contrast, so noise isn't boosted
+            cy[i] = min(cy[i], cy[i - 1] + 1.5 * (cx[i] - cx[i - 1]))
+        lut = np.clip(np.interp(np.arange(maxv + 1), cx, cy), 0, maxv).astype(np.float32)
+        sd[:, :, c] = lut[np.clip(sd[:, :, c], 0, maxv).astype(int)]
+        d[:, :, c] = lut[np.clip(d[:, :, c], 0, maxv).astype(int)]
+    lum = lambda x: x.mean(2)
+    den = G(wq) + 1e-4
+    gain = (G(lum(sb) * wq) / den + 2) / (G(lum(sd) * wq) / den + 2)
+    gain = cv2.resize(np.clip(gain, 0.5, 2.0), (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+    gain = gain[:, :, None]
+    out = base.copy()
+    mk = mask[y0:y1, x0:x1, None]
+    out[y0:y1, x0:x1, :3] = np.clip(b + (d * gain - b) * mk + 0.5, 0, maxv).astype(base.dtype)
+    return out
+
+
 def apply_detail(base, det, mask, sigma=25):
     """Blend the detail frame in through mask, keeping its fine detail but the stitch's coarse tone,
     so the different lighting of the detail shot does not show as a patch."""
@@ -557,6 +735,10 @@ def main():
     ap.add_argument("--vignetting", action="store_true",
                     help="also correct vignetting (off by default: raws developed with a lens profile "
                          "already are; use for photos without lens correction)")
+    ap.add_argument("--strip-res", action="store_true",
+                    help="with a close-up --detail photo (shot nearer), keep the output at the strip "
+                         "photos' resolution (default: the whole result gets the close-up's higher "
+                         "resolution, so markings are as readable as possible)")
     ap.add_argument("--keep-redundant", action="store_true",
                     help="use every image, even ones fully covered by the others (default: skip them)")
     ap.add_argument("--qa-image", action="store_true", help="also write <name>_qa.jpg marking ghost pixels")
@@ -628,17 +810,41 @@ def main():
             step("control points")
             run("cpfind", "--multirow", "--sieve2size", a.points, "-o", "b.pto", "a.pto")
             run("cpclean", "-o", "c.pto", "b.pto")
+            m = n - len(details)            # strip images; detail frames follow them
+            zooms = {}
+            if details:
+                cps, zooms = detail_points(images, m, read_pto(work / "c.pto"), log)
+                write_pto(work / "c.pto", cps)
             kept, ok = ransac_filter(work / "c.pto", work / "d.pto", a.ransac_px, log)
             if not ok or kept == 0:
                 return False
+
+            def optimise(src, var):
+                run("pto_var", "--opt", ",".join(var), "-o", "e.pto", src)
+                run("autooptimiser", "-n", "-o", "f.pto", "e.pto")
+                for _ in range(3):
+                    if prune(run, "f.pto", "f2.pto", log) == 0:
+                        break
+                    run("autooptimiser", "-n", "-o", "f.pto", "f2.pto")
+
             step("geometric optimisation")
-            geo = ["b0"] + [f"{v}{i}" for i in range(1, n) for v in ("r", "p", "y", "TrX", "TrY", "TrZ")]
-            run("pto_var", "--opt", ",".join(geo), "-o", "e.pto", "d.pto")
-            run("autooptimiser", "-n", "-o", "f.pto", "e.pto")
-            for _ in range(3):
-                if prune(run, "f.pto", "f2.pto", log) == 0:
-                    break
-                run("autooptimiser", "-n", "-o", "f.pto", "f2.pto")
+            # the strip first, on its own points: a detail frame (often a close-up from another
+            # distance) must not pull it around while its own position is still far off
+            lines = read_pto(work / "d.pto")
+            dcp = [l for l in lines if l.startswith("c ") and max(parse_cp(l)[:2]) >= m]
+            write_pto(work / "d1.pto", [l for l in lines if l not in dcp])
+            optimise("d1.pto", ["b0"] + [f"{v}{i}" for i in range(1, m)
+                                         for v in ("r", "p", "y", "TrX", "TrY", "TrZ")])
+            if details:
+                # then each detail frame against the fixed strip, with its own field of view
+                # (a close-up acts like a zoom on a flat board), starting from the zoom SIFT measured
+                lines = read_pto(work / "f.pto")
+                il = [k for k, x in enumerate(lines) if x.startswith("i ")]
+                for d in range(m, n):
+                    v = 2 * math.degrees(math.atan(math.tan(math.radians(fov / 2)) * zooms.get(d, 1)))
+                    lines[il[d]] = re.sub(r"\bv=?[-\d.e]+", f"v{v:.6f}", lines[il[d]])
+                write_pto(work / "d2.pto", lines + dcp)
+                optimise("d2.pto", [f"{x}{d}" for d in range(m, n) for x in ("v", "r", "p", "y")])
             return True
 
         if not align(ordered):
@@ -692,6 +898,35 @@ def main():
             write_pto(work / "h.pto", hl)
         run("pano_modify", "--projection=0", "--fov=AUTO", "--canvas=AUTO", "--crop=AUTO",
             "--output-type=NORMAL", "--ldr-file=PNG", "-o", "final.pto", "h.pto")
+        il = [x for x in read_pto(work / "h.pto") if x.startswith("i ")]
+        vfov = lambda x: float(re.search(r" v([\d.]+)", x).group(1)) if re.search(r" v[\d.]", x) else None
+        zooms = [math.tan(math.radians(vfov(il[0]) / 2)) / math.tan(math.radians((vfov(x) or vfov(il[0])) / 2))
+                 for x in il[n_main:]]
+        if n > n_main and (a.strip_res or max(zooms) <= 1.25):
+            # Hugin sizes the canvas for the sharpest frame, so by default a close-up raises the
+            # resolution of the whole result. --strip-res sizes it for the strip instead,
+            # using a copy without the detail frames (they are last, so the indices still hold).
+            hl, k, strip = read_pto(work / "final.pto"), 0, []
+            for x in hl:
+                if x.startswith("i "):
+                    k += 1
+                    if k > n_main:
+                        if strip and strip[-1].startswith("#-hugin"):
+                            strip.pop()
+                        continue
+                if x.startswith("c ") and max(parse_cp(x)[:2]) >= n_main:
+                    continue
+                strip.append(x)
+            write_pto(work / "strip.pto", strip)
+            run("pano_modify", "--projection=0", "--fov=AUTO", "--canvas=AUTO",
+                "-o", "strip_out.pto", "strip.pto")
+            sp = next(x for x in read_pto(work / "strip_out.pto") if x.startswith("p "))
+            size = {key: re.search(rf" {key}([\d.]+)", sp).group(1) for key in ("w", "h", "v")}
+            write_pto(work / "h2.pto", [re.sub(r" S\d+,\d+,\d+,\d+", "", re.sub(
+                r" ([whv])[\d.]+", lambda m: f" {m[1]}{size[m[1]]}", x)) if x.startswith("p ") else x
+                for x in hl])
+            run("pano_modify", "--crop=AUTO", "--output-type=NORMAL", "--ldr-file=PNG",
+                "-o", "final.pto", "h2.pto")
 
         final = read_pto(work / "final.pto")
         if n > n_main:
@@ -735,13 +970,20 @@ def main():
             margin = 2      # nona leaves partially covered pixels on the layer boundaries
 
         patched = None
-        for p, dl in zip(ordered[n_main:], detail_layers):
+        for p, dl, zoom in zip(ordered[n_main:], detail_layers, zooms):
             step(f"detail from {p.name}")
-            mask, area = detail_regions(res, dl)
+            if zoom > 1.25:
+                # a close-up: use it wherever it is sharper and matches, not only for markings
+                print(f"  {p.name}: close-up, {zoom:.1f}x the strip's magnification")
+                mask, area = closeup_regions(res, dl)
+                blend = apply_closeup
+            else:
+                mask, area = detail_regions(res, dl)
+                blend = apply_detail
             if area == 0:
                 print(f"  {p.name}: no area with more detail than the stitch; not used")
                 continue
-            res = apply_detail(res, dl, mask)
+            res = blend(res, dl, mask)
             patched = mask if patched is None else np.maximum(patched, mask)
             print(f"  {p.name}: used in {cv2.connectedComponents((mask > 0.5).astype(np.uint8))[0] - 1} "
                   f"region(s), {area / 1e6:.2f} MP")

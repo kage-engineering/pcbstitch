@@ -125,7 +125,8 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
 | `--png-dir DIR` | `<raw dir>/png` | where developed raws go |
 | `--rotate 0\|90\|180\|270` | `0` | coarse rotation applied when developing raws |
 | `--redevelop` | off | develop raws again even if PNGs exist |
-| `--detail IMAGE …` | none | extra photo(s), e.g. re-lit or refocused on a chip, used **only** where they show more detail than the stitch (see [Detail frames](#detail-frames-reading-chip-markings)) |
+| `--detail IMAGE …` | none | extra photo(s): re-lit or refocused on a chip, or a close-up shot nearer. Used only where they help (see [Detail frames](#detail-frames-reading-chip-markings)); a close-up raises the resolution of the whole result |
+| `--strip-res` | off | with a close-up `--detail`, keep the output at the strip photos' resolution |
 | `--vignetting` | off | also correct vignetting; only for photos developed without a lens correction |
 | `--keep-redundant` | off | use every image, even ones fully covered by the others |
 | `--qa-image` | off | write `<name>_qa.jpg` |
@@ -157,21 +158,29 @@ Default locations follow a `set/png/*.png` → `set/stitched/` layout:
    2. `cpclean`: Hugin's statistical outlier removal.
    3. **Planar filter**: for each image pair, keep only points consistent with one homography (RANSAC, 3 px).
    4. **Weak-pair removal**: drop a pair with under 20% of the strongest pair's points, if the images stay connected without it.
+
+   Detail frames get their points from OpenCV SIFT instead (see [Detail frames](#detail-frames-reading-chip-markings)).
 4. **Optimise geometry** (`autooptimiser -n`):
    - Image 0 is fixed. Every other image gets roll, pitch, yaw and X/Y/Z translation; barrel distortion `b` is shared.
    - The HFOV is **not** optimised.
    - Then up to three rounds of: compute each point's residual in source-image pixels, drop points above max(3 px, 3× median), re-optimise.
+   - Detail frames come second: with the strip fixed, each one gets roll, pitch, yaw and its **own** field of view, starting from the zoom SIFT measured, then the same prune rounds.
    - **Session check:** if the photos' EXIF capture times span more than an hour, it warns and lists them, because loose parts may have moved in between.
    - **Redundant frames:** with three or more images, each image's outline is projected onto the panorama. An image whose area is at least 97% covered by the others is skipped and reported, and steps 2–4 run again without it. It never drops the anchor, and never a frame the others need to stay linked by control points (at least 6 points per pair). It prefers to drop a frame taken furthest in time from the others, then the least sharp one. If the others still can't all be linked after a drop, it keeps every frame. `--keep-redundant` turns this off.
 5. **Optimise photometrics** (`vig_optimize`): exposure of each non-anchor image and the camera response curve (`Ra…Re`). Vignetting (`Vb Vc Vd`) is only fitted with `--vignetting`, because the lens profile in RawTherapee already corrects it ([why](#photometrics)). The anchor frame keeps its developed colours exactly. Detail frames are aligned in steps 2–4 like the others, but are marked `disabled` for this step. They're then given the strip's exposure, and the output exposure `E` is set to the strip's mean.
 6. **Set up output** (`pano_modify`): rectilinear projection, automatic FOV and canvas, autocrop.
+   Hugin sizes the canvas for the sharpest image, so a close-up detail frame raises the
+   resolution of the whole result. Without a close-up, or with `--strip-res`, the canvas is sized
+   from a copy of the project without the detail frames.
 7. **Render** each image as its own full-canvas layer (`nona -m TIFF_m`).
 8. **Blend**:
    - **seams** (a single row or column): for each neighbouring pair, find the cheapest left-to-right path through the overlap, where cost is how much the two layers differ. Each pixel is then assigned to **exactly one** layer: the one whose band between seams contains it, or else the nearest layer in the strip that covers it. The labels are feathered (σ = `band`/2) into the composite.
    - **enblend**: plain `enblend` on the layers, as Hugin itself does.
 
    Detail frames are left out of both.
-9. **Patch in detail frames** (`--detail`): paste each one into the regions where it shows clearly more fine detail than the stitch while agreeing with it at a coarse scale. The patch keeps the frame's fine detail but takes the stitch's coarse tone.
+9. **Patch in detail frames** (`--detail`):
+   - **Same scale** (re-lit or refocused): paste it into the regions where it shows clearly more fine detail than the stitch while agreeing with it at a coarse scale. The patch keeps the frame's fine detail but takes the stitch's coarse tone.
+   - **Close-up** (more than 1.25× the strip's magnification): use it over its whole overlap, except sizeable areas whose structure doesn't match (tall or moved parts). Its colours are mapped to the stitch's with a per-channel tone curve and a smooth brightness gain.
 10. **Write output**:
    - Crop to Hugin's autocrop rectangle, computed over the strip only and shrunk by a few pixels (see below).
    - Write the PNG and insert the `iCCP` and `eXIf` chunks from the anchor image.
@@ -356,7 +365,8 @@ difference is purely lighting.
 Treating that shot as a normal frame is wrong: it was skipped as redundant, and when kept, the
 antenna boards that had moved left a fragment. So `--detail` frames are handled separately:
 
-- **Alignment:** same as the strip (they share its control points), so they line up to about 1 px.
+- **Alignment.** Detail frames are matched with OpenCV SIFT, not cpfind (details below), so
+  they line up to about 1–2 px.
 - **Where they're used.** At half resolution, compare fine-detail strength (a blurred high-pass)
   between the stitch and the detail frame:
   - The detail frame is first scaled to the stitch's local brightness. Otherwise a brighter
@@ -385,6 +395,37 @@ Pitfalls found while building this:
   evened out the PNGs' brightness.
 - **Autocrop.** It runs over all enabled images, and the detail frame reached 4 px past the
   strip's edge. The crop is computed with detail frames disabled.
+
+#### Close-ups
+
+In another set, the fifth photo was a close-up of a small chip (an SGM706 next to the
+electrolytics). It was shot about 1.7× nearer than the strip, rotated 180°, two days later, with
+the light from the other side. Each of these broke something:
+
+- **Matching.** cpfind found 9 matches for it, and the run stopped with "could not all be
+  connected". OpenCV SIFT (ratio test 0.75, then RANSAC homography at 3 px, at half resolution)
+  found 996 consistent matches with one strip photo and 755 with another. Up to 100 per pair are
+  used; pairs with under 30 inliers or an implausible scale are ignored.
+- **Optimisation.** With everything optimised together, the close-up's Z translation ran past the
+  board plane and dragged the strip with it (177 px mean error). Now the strip is optimised on
+  its own points first. Then each detail frame is fitted to the fixed strip with its own field
+  of view (a nearer camera over a flat board acts as a zoom), starting from the SIFT zoom. Mean
+  error is about 1.7 px, measured in the close-up's larger pixels.
+- **Resolution.** At the strip's resolution the close-up was only about 1.6× "sharper" on the
+  chip, and its marking was barely better. Rendered at its own resolution (10340×18210 instead
+  of 5917×10421), `SGM706-SY58 2540C` reads cleanly. So a close-up sets the output resolution.
+- **Where it's used.** Fine-detail strength is a poor judge here: the stitch's harder light made
+  glinting pins score as "detail". The test is structure instead: local normalised correlation
+  (σ = 8 at quarter resolution), which ignores lighting. Flat board, chips and print correlate
+  at 0.8–0.95. Heatsinks and capacitor tops don't, because the nearer camera sees them from
+  another angle. Sizeable blobs under 0.3 are excluded with a margin. The rest stays whole, with
+  holes filled, because the close-up agrees with itself. Excluding every small disagreement
+  punched holes through the chip, where its 1.5 mm height gives a few pixels of parallax.
+- **Colour.** The close-up was developed with another white balance and auto tone curve. An
+  additive local match left pink halos on white print, and a single per-channel gain turned the
+  white background pink. A per-channel tone curve works: for each close-up level, the median
+  stitch level at the same places, made monotonic with the slope capped at 1.5 so dark noise
+  isn't boosted. A smooth brightness gain (σ = 100 px) is applied on top.
 
 ### Edges and cropping
 
@@ -484,7 +525,9 @@ Things that made stitching harder in practice:
   boards had moved since, which left a fragment of one in the stitch.
 - **Shoot extra frames for unreadable chips.** If chip markings don't show, take one more shot
   with the light at a low angle across the chip (or the camera refocused on its top), and pass it
-  with `--detail`. Only the areas where it shows more detail are used.
+  with `--detail`. Only the areas where it shows more detail are used. A close-up taken nearer
+  also works, and gives the best readability: the whole result is then rendered at its
+  resolution.
 - **Retakes.** If you pass both a frame and its retake, the redundancy check drops one of them,
   preferring the less sharp one. In one set the retake was 3–8× less sharp (variance of
   Laplacian) than the original. To check yourself:
@@ -499,7 +542,7 @@ Things that made stitching harder in practice:
 | Symptom | Likely cause and fix |
 |---|---|
 | `has no focal length in EXIF` | the input was exported without EXIF. Pass `--focal` (and `--crop-factor`) or `--fov`. |
-| `images could not all be connected` | too little overlap, frames in the wrong set, or a featureless area. Check the order and overlap; try `--points 6`. |
+| `images could not all be connected` | too little overlap, frames in the wrong set, or a featureless area. Check the order and overlap; try `--points 6`. A close-up or re-lit chip shot must be passed with `--detail`, not as a strip photo. |
 | High mean error (> 2–3 px) | parallax or moved objects dominating. Check `<name>_stitched.log` for how many points the planar filter kept per pair. A lower `--ransac-px` is stricter. |
 | Ghost regions in the summary | use `--qa-image` to see them. Often a tall part or a moved cable inside the overlap with no clean path round it; more overlap or re-shooting helps. Try `--band 12` for a tighter seam. |
 | `photos were taken at different times` | the frames come from different sessions; anything loose may have moved. Prefer frames from one session. |
